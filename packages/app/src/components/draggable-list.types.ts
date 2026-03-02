@@ -2,11 +2,22 @@ import type { ReactElement, MutableRefObject } from "react";
 import type { StyleProp, ViewStyle } from "react-native";
 import type { GestureType } from "react-native-gesture-handler";
 
+export interface DraggableListDragHandleProps {
+  /**
+   * Web-only drag handle props (from dnd-kit). Spread these onto the element
+   * that should initiate the drag. Native uses the `drag()` callback instead.
+   */
+  attributes?: Record<string, unknown>;
+  listeners?: Record<string, unknown>;
+  setActivatorNodeRef?: (node: unknown) => void;
+}
+
 export interface DraggableRenderItemInfo<T> {
   item: T;
   index: number;
   drag: () => void;
   isActive: boolean;
+  dragHandleProps?: DraggableListDragHandleProps;
 }
 
 export interface DraggableListProps<T> {
@@ -15,6 +26,8 @@ export interface DraggableListProps<T> {
   renderItem: (info: DraggableRenderItemInfo<T>) => ReactElement;
   onDragEnd: (data: T[]) => void;
   style?: StyleProp<ViewStyle>;
+  /** Outer container style (useful for nested, non-scrolling lists). */
+  containerStyle?: StyleProp<ViewStyle>;
   contentContainerStyle?: StyleProp<ViewStyle>;
   testID?: string;
   ListFooterComponent?: ReactElement | null;
@@ -22,6 +35,13 @@ export interface DraggableListProps<T> {
   ListEmptyComponent?: ReactElement | null;
   showsVerticalScrollIndicator?: boolean;
   enableDesktopWebScrollbar?: boolean;
+  /** When false, disables internal scrolling (use outer list to scroll). */
+  scrollEnabled?: boolean;
+  /**
+   * Web-only: when true, the drag can only be initiated from the handle props
+   * passed to `renderItem` (prevents nested lists from fighting).
+   */
+  useDragHandle?: boolean;
   refreshing?: boolean;
   onRefresh?: () => void;
   /** Fill remaining space when content is smaller than container */

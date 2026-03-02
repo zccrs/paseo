@@ -383,8 +383,7 @@ const shouldRun = !process.env.CI;
       await waitForCondition(() => sawExit, 10000);
 
       const next = await ctx.client.listTerminals(cwd);
-      expect(next.terminals).toHaveLength(1);
-      expect(next.terminals[0].id).not.toBe(terminalId);
+      expect(next.terminals).toHaveLength(0);
 
       unsubscribeExit();
       rmSync(cwd, { recursive: true, force: true });

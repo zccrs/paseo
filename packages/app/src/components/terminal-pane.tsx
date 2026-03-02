@@ -9,6 +9,7 @@ import {
   View,
 } from "react-native";
 import { Plus, X } from "lucide-react-native";
+import Animated, { runOnJS, useAnimatedReaction } from "react-native-reanimated";
 import Svg, {
   Defs,
   LinearGradient as SvgLinearGradient,
@@ -19,6 +20,7 @@ import { StyleSheet, UnistylesRuntime, useUnistyles } from "react-native-unistyl
 import type { ListTerminalsResponse } from "@server/shared/messages";
 import { encodeTerminalKeyInput } from "@server/shared/terminal-key-input";
 import { useHostRuntimeSession } from "@/runtime/host-runtime";
+import { useKeyboardShiftStyle } from "@/hooks/use-keyboard-shift-style";
 import {
   hasPendingTerminalModifiers,
   normalizeTerminalTransportKey,
@@ -145,6 +147,10 @@ export function TerminalPane({
   const { theme } = useUnistyles();
   const isMobile =
     UnistylesRuntime.breakpoint === "xs" || UnistylesRuntime.breakpoint === "sm";
+  const { shift: keyboardShift, style: keyboardPaddingStyle } = useKeyboardShiftStyle({
+    mode: "padding",
+    enabled: isMobile,
+  });
 
   const queryClient = useQueryClient();
   const { client, isConnected } = useHostRuntimeSession(serverId);
@@ -185,6 +191,7 @@ export function TerminalPane({
   const hoverOutTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const selectedTerminalIdRef = useRef<string | null>(selectedTerminalId);
   const pendingTerminalInputRef = useRef<PendingTerminalInput[]>([]);
+  const keyboardRefitTimeoutsRef = useRef<Array<ReturnType<typeof setTimeout>>>([]);
 
   const updateSelectedTerminalId = useCallback(
     (
@@ -298,6 +305,41 @@ export function TerminalPane({
     setResizeRequestToken((current) => current + 1);
   }, []);
 
+  const clearKeyboardRefitTimeouts = useCallback(() => {
+    if (keyboardRefitTimeoutsRef.current.length === 0) {
+      return;
+    }
+    for (const handle of keyboardRefitTimeoutsRef.current) {
+      clearTimeout(handle);
+    }
+    keyboardRefitTimeoutsRef.current = [];
+  }, []);
+
+  const pulseKeyboardRefits = useCallback(() => {
+    clearKeyboardRefitTimeouts();
+    requestTerminalReflow();
+    keyboardRefitTimeoutsRef.current = TERMINAL_REFIT_DELAYS_MS.map((delayMs) =>
+      setTimeout(() => {
+        requestTerminalReflow();
+      }, delayMs)
+    );
+  }, [clearKeyboardRefitTimeouts, requestTerminalReflow]);
+
+  useEffect(() => {
+    return () => clearKeyboardRefitTimeouts();
+  }, [clearKeyboardRefitTimeouts]);
+
+  useAnimatedReaction(
+    () => keyboardShift.value > 0,
+    (next, prev) => {
+      if (next === prev) {
+        return;
+      }
+      runOnJS(pulseKeyboardRefits)();
+    },
+    [pulseKeyboardRefits]
+  );
+
   useFocusEffect(
     useCallback(() => {
       if (!selectedTerminalId) {
@@ -353,16 +395,8 @@ export function TerminalPane({
         streamId: message.payload.streamId,
       });
       setModifiers({ ...EMPTY_MODIFIERS });
-
-      void queryClient.invalidateQueries({
-        queryKey: terminalsQueryKey,
-      });
-      void queryClient.refetchQueries({
-        queryKey: terminalsQueryKey,
-        type: "active",
-      });
     });
-  }, [client, isConnected, queryClient, terminalsQueryKey]);
+  }, [client, isConnected]);
 
   useEffect(() => {
     if (
@@ -381,13 +415,12 @@ export function TerminalPane({
       if (message.payload.cwd !== cwd) {
         return;
       }
-      void queryClient.invalidateQueries({
-        queryKey: terminalsQueryKey,
-      });
-      void queryClient.refetchQueries({
-        queryKey: terminalsQueryKey,
-        type: "active",
-      });
+
+      queryClient.setQueryData<ListTerminalsPayload>(terminalsQueryKey, (current) => ({
+        cwd: message.payload.cwd,
+        terminals: message.payload.terminals,
+        requestId: current?.requestId ?? `terminals-changed-${Date.now()}`,
+      }));
     });
 
     client.subscribeTerminals({ cwd });
@@ -960,7 +993,7 @@ export function TerminalPane({
   const combinedError = streamError ?? closeError ?? createError ?? queryError;
 
   return (
-    <View style={styles.container}>
+    <Animated.View style={[styles.container, keyboardPaddingStyle]}>
       {!hideHeader ? (
         <View style={styles.header} testID="terminals-header">
           <ScrollView
@@ -1161,7 +1194,7 @@ export function TerminalPane({
           </ScrollView>
         </View>
       ) : null}
-    </View>
+    </Animated.View>
   );
 }
 

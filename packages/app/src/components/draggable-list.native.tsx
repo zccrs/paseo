@@ -17,6 +17,7 @@ export function DraggableList<T>({
   renderItem,
   onDragEnd,
   style,
+  containerStyle,
   contentContainerStyle,
   testID,
   ListFooterComponent,
@@ -24,6 +25,8 @@ export function DraggableList<T>({
   ListEmptyComponent,
   showsVerticalScrollIndicator = true,
   enableDesktopWebScrollbar: _enableDesktopWebScrollbar = false,
+  scrollEnabled = true,
+  useDragHandle: _useDragHandle = false,
   refreshing,
   onRefresh,
   simultaneousGestureRef,
@@ -70,6 +73,8 @@ export function DraggableList<T>({
   }, []);
 
   const showRefreshControl = Boolean(onRefresh) && (!isDragging || Boolean(refreshing));
+  const resolvedContainerStyle =
+    containerStyle ?? (scrollEnabled ? { flex: 1 } : undefined);
 
   return (
     <DraggableFlatList
@@ -79,12 +84,13 @@ export function DraggableList<T>({
       renderItem={handleRenderItem}
       onDragEnd={handleDragEnd}
       style={style}
-      containerStyle={{ flex: 1 }}
+      containerStyle={resolvedContainerStyle}
       contentContainerStyle={contentContainerStyle}
       ListFooterComponent={ListFooterComponent}
       ListHeaderComponent={ListHeaderComponent}
       ListEmptyComponent={ListEmptyComponent}
       showsVerticalScrollIndicator={showsVerticalScrollIndicator}
+      scrollEnabled={scrollEnabled}
       simultaneousHandlers={simultaneousHandlers}
       // Higher activationDistance prevents drag from interfering with nested onLongPress handlers
       activationDistance={20}

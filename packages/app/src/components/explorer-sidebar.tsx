@@ -9,7 +9,6 @@ import Animated, {
 } from "react-native-reanimated";
 import { Gesture, GestureDetector } from "react-native-gesture-handler";
 import { StyleSheet, UnistylesRuntime, useUnistyles } from "react-native-unistyles";
-import { useReanimatedKeyboardAnimation } from "react-native-keyboard-controller";
 import { X } from "lucide-react-native";
 import {
   usePanelStore,
@@ -21,9 +20,9 @@ import { useExplorerSidebarAnimation } from "@/contexts/explorer-sidebar-animati
 import { HEADER_INNER_HEIGHT } from "@/constants/layout";
 import { GitDiffPane } from "./git-diff-pane";
 import { FileExplorerPane } from "./file-explorer-pane";
+import { useKeyboardShiftStyle } from "@/hooks/use-keyboard-shift-style";
 
 const MIN_CHAT_WIDTH = 400;
-const IOS_KEYBOARD_INSET_MIN_HEIGHT = 120;
 const IS_DEV = Boolean((globalThis as { __DEV__?: boolean }).__DEV__);
 
 function logExplorerSidebar(event: string, details: Record<string, unknown>): void {
@@ -31,16 +30,6 @@ function logExplorerSidebar(event: string, details: Record<string, unknown>): vo
     return;
   }
   console.log(`[ExplorerSidebar] ${event}`, details);
-}
-
-function resolveKeyboardShift(rawHeight: number, inset: number): number {
-  "worklet";
-  // iOS can report a small accessory/prediction bar height during touch focus.
-  // Treat that as non-keyboard so terminal scroll gestures don't "bounce" the layout.
-  if (Platform.OS === "ios" && rawHeight < IOS_KEYBOARD_INSET_MIN_HEIGHT) {
-    return 0;
-  }
-  return Math.max(0, rawHeight - inset);
 }
 
 interface ExplorerSidebarProps {
@@ -69,14 +58,13 @@ export function ExplorerSidebar({
   const setExplorerTabForCheckout = usePanelStore((state) => state.setExplorerTabForCheckout);
   const setExplorerWidth = usePanelStore((state) => state.setExplorerWidth);
   const { width: viewportWidth } = useWindowDimensions();
-  const { height: keyboardHeight } = useReanimatedKeyboardAnimation();
-  const bottomInset = useSharedValue(insets.bottom);
   const closeTouchStartX = useSharedValue(0);
   const closeTouchStartY = useSharedValue(0);
 
-  useEffect(() => {
-    bottomInset.value = insets.bottom;
-  }, [bottomInset, insets.bottom]);
+  const { style: mobileKeyboardInsetStyle } = useKeyboardShiftStyle({
+    mode: "padding",
+    enabled: isMobile,
+  });
 
   useEffect(() => {
     if (isMobile) {
@@ -257,14 +245,6 @@ export function ExplorerSidebar({
     pointerEvents: backdropOpacity.value > 0.01 ? "auto" : "none",
   }));
 
-  const mobileKeyboardInsetStyle = useAnimatedStyle(() => {
-    const absoluteHeight = Math.abs(keyboardHeight.value);
-    const shift = resolveKeyboardShift(absoluteHeight, bottomInset.value);
-    return {
-      paddingBottom: bottomInset.value + shift,
-    };
-  });
-
   const resizeAnimatedStyle = useAnimatedStyle(() => ({
     width: resizeWidth.value,
   }));
@@ -322,7 +302,9 @@ export function ExplorerSidebar({
   }
 
   return (
-    <Animated.View style={[styles.desktopSidebar, resizeAnimatedStyle]}>
+    <Animated.View
+      style={[styles.desktopSidebar, resizeAnimatedStyle, { paddingTop: insets.top }]}
+    >
       {/* Resize handle - absolutely positioned over left border */}
       <GestureDetector gesture={resizeGesture}>
         <View

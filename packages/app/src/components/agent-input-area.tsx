@@ -2,8 +2,7 @@ import { View, Pressable, Text, ActivityIndicator, Platform } from 'react-native
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { StyleSheet, useUnistyles } from 'react-native-unistyles'
 import { ArrowUp, Square, Pencil, AudioLines } from 'lucide-react-native'
-import Animated, { useAnimatedStyle } from 'react-native-reanimated'
-import { useReanimatedKeyboardAnimation } from 'react-native-keyboard-controller'
+import Animated from 'react-native-reanimated'
 import { useSafeAreaInsets } from 'react-native-safe-area-context'
 import { useIsFocused } from '@react-navigation/native'
 import { FOOTER_HEIGHT, MAX_CONTENT_WIDTH } from '@/constants/layout'
@@ -37,6 +36,7 @@ import {
 } from '@/attachments/service'
 import { shouldSkipDraftPersist } from '@/components/agent-input-area.draft-persist-guard'
 import { markScrollInvestigationRender } from '@/utils/scroll-jank-investigation'
+import { useKeyboardShiftStyle } from '@/hooks/use-keyboard-shift-style'
 
 type QueuedMessage = {
   id: string
@@ -84,7 +84,6 @@ export function AgentInputArea({
   markScrollInvestigationRender(`AgentInputArea:${serverId}:${agentId}`)
   const { theme } = useUnistyles()
   const insets = useSafeAreaInsets()
-  const { height: keyboardHeight } = useReanimatedKeyboardAnimation()
   const isScreenFocused = useIsFocused()
   const messageInputActionRequest = useKeyboardShortcutsStore((s) => s.messageInputActionRequest)
   const clearMessageInputActionRequest = useKeyboardShortcutsStore(
@@ -551,13 +550,8 @@ export function AgentInputArea({
     serverId,
   ])
 
-  const keyboardAnimatedStyle = useAnimatedStyle(() => {
-    'worklet'
-    const absoluteHeight = Math.abs(keyboardHeight.value)
-    const shift = Math.max(0, absoluteHeight - insets.bottom)
-    return {
-      transform: [{ translateY: -shift }],
-    }
+  const { style: keyboardAnimatedStyle } = useKeyboardShiftStyle({
+    mode: 'translate',
   })
 
   function handleCancelAgent() {

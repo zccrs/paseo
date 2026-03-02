@@ -6,9 +6,8 @@ import { useLocalSearchParams, useRouter } from 'expo-router'
 import { useIsFocused } from '@react-navigation/native'
 import { StyleSheet, UnistylesRuntime, useUnistyles } from 'react-native-unistyles'
 import { useSafeAreaInsets } from 'react-native-safe-area-context'
-import { useReanimatedKeyboardAnimation } from 'react-native-keyboard-controller'
 import { GestureDetector } from 'react-native-gesture-handler'
-import Animated, { useAnimatedStyle, useSharedValue } from 'react-native-reanimated'
+import Animated from 'react-native-reanimated'
 import { Folder, GitBranch, PanelRight } from 'lucide-react-native'
 import { SidebarMenuToggle } from '@/components/headers/menu-header'
 import { HeaderToggleButton } from '@/components/headers/header-toggle-button'
@@ -51,6 +50,7 @@ import type {
 import { AGENT_PROVIDER_DEFINITIONS } from '@server/server/agent/provider-manifest'
 import { buildHostAgentDetailRoute } from '@/utils/host-routes'
 import { useTauriDragHandlers } from '@/utils/tauri-window'
+import { useKeyboardShiftStyle } from '@/hooks/use-keyboard-shift-style'
 
 const DRAFT_AGENT_ID = '__new_agent__'
 const EMPTY_PENDING_PERMISSIONS = new Map()
@@ -148,20 +148,8 @@ function DraftAgentScreenContent({
   )
   const params = useLocalSearchParams<DraftAgentParams>()
 
-  const { height: keyboardHeight } = useReanimatedKeyboardAnimation()
-  const bottomInset = useSharedValue(insets.bottom)
-
-  useEffect(() => {
-    bottomInset.value = insets.bottom
-  }, [insets.bottom, bottomInset])
-
-  const animatedKeyboardStyle = useAnimatedStyle(() => {
-    'worklet'
-    const absoluteHeight = Math.abs(keyboardHeight.value)
-    const shift = Math.max(0, absoluteHeight - bottomInset.value)
-    return {
-      transform: [{ translateY: -shift }],
-    }
+  const { style: animatedKeyboardStyle } = useKeyboardShiftStyle({
+    mode: 'translate',
   })
 
   const forcedServerIdParam = forcedServerId?.trim()

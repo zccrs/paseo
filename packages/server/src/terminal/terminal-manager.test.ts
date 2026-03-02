@@ -200,13 +200,15 @@ describe("TerminalManager", () => {
       expect(manager.getTerminal(id)).toBeUndefined();
     });
 
-    it("removes cwd entry when last terminal is killed", async () => {
+    it("keeps cwd entry when last terminal is killed (but does not auto-recreate)", async () => {
       manager = createTerminalManager();
       const terminals = await manager.getTerminals("/tmp");
 
       manager.killTerminal(terminals[0].id);
 
-      expect(manager.listDirectories()).not.toContain("/tmp");
+      expect(manager.listDirectories()).toContain("/tmp");
+      const remaining = await manager.getTerminals("/tmp");
+      expect(remaining).toHaveLength(0);
     });
 
     it("keeps cwd entry when other terminals remain", async () => {
@@ -239,8 +241,7 @@ describe("TerminalManager", () => {
       expect(manager.getTerminal(exitedId)).toBeUndefined();
 
       const remaining = await manager.getTerminals("/tmp");
-      expect(remaining).toHaveLength(1);
-      expect(remaining[0].id).not.toBe(exitedId);
+      expect(remaining).toHaveLength(0);
     });
   });
 
@@ -250,7 +251,7 @@ describe("TerminalManager", () => {
       expect(manager.listDirectories()).toEqual([]);
     });
 
-    it("returns all cwds with active terminals", async () => {
+    it("returns all cwds that have ever had terminals", async () => {
       manager = createTerminalManager();
       await manager.getTerminals("/tmp");
       await manager.getTerminals("/home");

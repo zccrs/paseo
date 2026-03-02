@@ -12,12 +12,8 @@ import { useRouter } from "expo-router";
 import * as Clipboard from "expo-clipboard";
 import { useFocusEffect } from "@react-navigation/native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
-import { useReanimatedKeyboardAnimation } from "react-native-keyboard-controller";
 import { useQueryClient } from "@tanstack/react-query";
-import ReanimatedAnimated, {
-  useAnimatedStyle,
-  useSharedValue,
-} from "react-native-reanimated";
+import ReanimatedAnimated from "react-native-reanimated";
 import { GestureDetector } from "react-native-gesture-handler";
 import { StyleSheet, UnistylesRuntime, useUnistyles } from "react-native-unistyles";
 import {
@@ -78,6 +74,7 @@ import {
   normalizeAgentSnapshot,
 } from "@/utils/agent-snapshots";
 import { mergePendingCreateImages } from "@/utils/pending-create-images";
+import { useKeyboardShiftStyle } from "@/hooks/use-keyboard-shift-style";
 import { shouldClearAgentAttentionOnView } from "@/utils/agent-attention";
 import type { DaemonClient } from "@server/client/daemon-client";
 import { useExplorerOpenGesture } from "@/hooks/use-explorer-open-gesture";
@@ -508,20 +505,8 @@ function AgentScreenContent({
     [serverId]
   );
 
-  const { height: keyboardHeight } = useReanimatedKeyboardAnimation();
-  const bottomInset = useSharedValue(insets.bottom);
-
-  useEffect(() => {
-    bottomInset.value = insets.bottom;
-  }, [insets.bottom, bottomInset]);
-
-  const animatedKeyboardStyle = useAnimatedStyle(() => {
-    "worklet";
-    const absoluteHeight = Math.abs(keyboardHeight.value);
-    const shift = Math.max(0, absoluteHeight - bottomInset.value);
-    return {
-      transform: [{ translateY: -shift }],
-    };
+  const { style: animatedKeyboardStyle } = useKeyboardShiftStyle({
+    mode: "translate",
   });
 
   const handleHistorySyncFailure = useCallback(

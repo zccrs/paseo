@@ -25,6 +25,7 @@ export interface SidebarWorkspaceEntry {
   createdAt: Date | null
   isMainCheckout: boolean
   isPaseoOwnedWorktree: boolean
+  statusBucket: SidebarStateBucket
 }
 
 export interface SidebarProjectEntry {
@@ -54,6 +55,7 @@ interface MutableWorkspaceEntry {
   createdAt: Date | null
   isMainCheckout: boolean
   isPaseoOwnedWorktree: boolean
+  statusBucket: SidebarStateBucket
 }
 
 interface MutableProjectEntry {
@@ -256,6 +258,7 @@ function ensureWorkspace(
     createdAt: input.createdAt,
     isMainCheckout: input.isMainCheckout,
     isPaseoOwnedWorktree: input.isPaseoOwnedWorktree,
+    statusBucket: 'done',
   }
   project.workspacesByKey.set(workspaceKey, workspace)
   return workspace
@@ -394,6 +397,7 @@ export function useSidebarAgentsList(options?: {
         isMainCheckout,
         isPaseoOwnedWorktree: placement.checkout.isPaseoOwnedWorktree,
       })
+      workspace.statusBucket = aggregateBucket(workspace.statusBucket, bucket)
 
       const explicitMainRepoRoot = normalizePath(placement.checkout.mainRepoRoot)
       if (placement.checkout.isPaseoOwnedWorktree && explicitMainRepoRoot) {
@@ -573,6 +577,7 @@ export function useSidebarAgentsList(options?: {
             createdAt: workspace.createdAt,
             isMainCheckout: workspace.isMainCheckout,
             isPaseoOwnedWorktree: workspace.isPaseoOwnedWorktree,
+            statusBucket: workspace.statusBucket,
           })
         )
 

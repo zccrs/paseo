@@ -26,38 +26,87 @@ async function openWorkspaceWithAgent(page: Page, workspacePath: string): Promis
   await expect(page).toHaveURL(new RegExp(`/h/${encodeURIComponent(serverId)}/workspace/`), {
     timeout: 30000,
   });
-  await expect(page.getByTestId("workspace-new-tab").first()).toBeVisible({
+  await expect(page.getByTestId("workspace-new-agent-tab").first()).toBeVisible({
+    timeout: 30000,
+  });
+  await expect(page.getByTestId("workspace-new-terminal-tab").first()).toBeVisible({
     timeout: 30000,
   });
 }
 
-test("workspace new-tab menu opens on-screen", async ({ page }) => {
+test("workspace new-tab buttons stay on-screen during horizontal scroll", async ({ page }) => {
   const repo = await createTempGitRepo("paseo-e2e-workspace-new-tab-");
 
   try {
     await openWorkspaceWithAgent(page, repo.path);
 
-    const trigger = page.getByTestId("workspace-new-tab").first();
-    await expect(trigger).toBeVisible({ timeout: 30000 });
-    await trigger.click();
+    const agentButton = page.getByTestId("workspace-new-agent-tab").first();
+    const terminalButton = page.getByTestId("workspace-new-terminal-tab").first();
+    const tabsScroll = page.getByTestId("workspace-tabs-scroll").first();
+    await expect(agentButton).toBeVisible({ timeout: 30000 });
+    await expect(terminalButton).toBeVisible({ timeout: 30000 });
+    await expect(tabsScroll).toBeVisible({ timeout: 30000 });
 
-    const menu = page.getByTestId("workspace-new-tab-content").first();
-    await expect(menu).toBeVisible({ timeout: 10000 });
+    // Create enough terminal tabs to ensure the tabs row has overflow to scroll.
+    const terminalTabs = page.locator('[data-testid^="workspace-tab-terminal:"]');
+    const initialTerminalCount = await terminalTabs.count();
+    const targetTerminalCount = initialTerminalCount + 8;
 
-    const menuBounds = await menu.boundingBox();
+    for (let attempt = initialTerminalCount; attempt < targetTerminalCount; attempt += 1) {
+      await expect(terminalButton).toBeEnabled({ timeout: 30000 });
+      await terminalButton.click();
+      await expect
+        .poll(async () => await terminalTabs.count(), { timeout: 30000 })
+        .toBeGreaterThanOrEqual(attempt + 1);
+    }
+
+    const agentBoundsBefore = await agentButton.boundingBox();
+    const terminalBoundsBefore = await terminalButton.boundingBox();
     const viewport = page.viewportSize();
 
-    expect(menuBounds).not.toBeNull();
+    expect(agentBoundsBefore).not.toBeNull();
+    expect(terminalBoundsBefore).not.toBeNull();
     expect(viewport).not.toBeNull();
 
-    if (!menuBounds || !viewport) {
+    if (!agentBoundsBefore || !terminalBoundsBefore || !viewport) {
       return;
     }
 
-    expect(menuBounds.x).toBeGreaterThanOrEqual(0);
-    expect(menuBounds.y).toBeGreaterThanOrEqual(0);
-    expect(menuBounds.x + menuBounds.width).toBeLessThanOrEqual(viewport.width);
-    expect(menuBounds.y + menuBounds.height).toBeLessThanOrEqual(viewport.height);
+    expect(agentBoundsBefore.x).toBeGreaterThanOrEqual(0);
+    expect(agentBoundsBefore.y).toBeGreaterThanOrEqual(0);
+    expect(agentBoundsBefore.x + agentBoundsBefore.width).toBeLessThanOrEqual(viewport.width);
+    expect(agentBoundsBefore.y + agentBoundsBefore.height).toBeLessThanOrEqual(viewport.height);
+
+    expect(terminalBoundsBefore.x).toBeGreaterThanOrEqual(0);
+    expect(terminalBoundsBefore.y).toBeGreaterThanOrEqual(0);
+    expect(terminalBoundsBefore.x + terminalBoundsBefore.width).toBeLessThanOrEqual(viewport.width);
+    expect(terminalBoundsBefore.y + terminalBoundsBefore.height).toBeLessThanOrEqual(viewport.height);
+
+    // Scroll tabs horizontally; the new-tab buttons should remain fixed on the right edge.
+    await tabsScroll.evaluate((el) => {
+      (el as HTMLElement).scrollLeft = (el as HTMLElement).scrollWidth;
+    });
+    await page.waitForTimeout(200);
+
+    const agentBoundsAfter = await agentButton.boundingBox();
+    const terminalBoundsAfter = await terminalButton.boundingBox();
+
+    expect(agentBoundsAfter).not.toBeNull();
+    expect(terminalBoundsAfter).not.toBeNull();
+
+    if (!agentBoundsAfter || !terminalBoundsAfter) {
+      return;
+    }
+
+    expect(agentBoundsAfter.x).toBeGreaterThanOrEqual(0);
+    expect(agentBoundsAfter.y).toBeGreaterThanOrEqual(0);
+    expect(agentBoundsAfter.x + agentBoundsAfter.width).toBeLessThanOrEqual(viewport.width);
+    expect(agentBoundsAfter.y + agentBoundsAfter.height).toBeLessThanOrEqual(viewport.height);
+
+    expect(terminalBoundsAfter.x).toBeGreaterThanOrEqual(0);
+    expect(terminalBoundsAfter.y).toBeGreaterThanOrEqual(0);
+    expect(terminalBoundsAfter.x + terminalBoundsAfter.width).toBeLessThanOrEqual(viewport.width);
+    expect(terminalBoundsAfter.y + terminalBoundsAfter.height).toBeLessThanOrEqual(viewport.height);
   } finally {
     await repo.cleanup();
   }

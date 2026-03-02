@@ -31,7 +31,7 @@ export function deriveSidebarStateBucket(input: {
   if (input.status === "error" || input.attentionReason === "error") {
     return "failed";
   }
-  if (input.status === "running") {
+  if (input.status === "running" || input.status === "initializing") {
     return "running";
   }
   if (input.requiresAttention) {

@@ -41,6 +41,7 @@ interface SortableItemProps<T> {
   index: number;
   renderItem: (info: DraggableRenderItemInfo<T>) => ReactElement;
   activeId: string | null;
+  useDragHandle: boolean;
 }
 
 function SortableItem<T>({
@@ -49,11 +50,13 @@ function SortableItem<T>({
   index,
   renderItem,
   activeId,
+  useDragHandle,
 }: SortableItemProps<T>) {
   const {
     attributes,
     listeners,
     setNodeRef,
+    setActivatorNodeRef,
     transform,
     transition,
     isDragging,
@@ -87,10 +90,23 @@ function SortableItem<T>({
     index,
     drag,
     isActive: activeId === id,
+    dragHandleProps: useDragHandle
+      ? {
+          attributes: attributes as unknown as Record<string, unknown>,
+          listeners: listeners as unknown as Record<string, unknown>,
+          setActivatorNodeRef: setActivatorNodeRef as unknown as (
+            node: unknown
+          ) => void,
+        }
+      : undefined,
   };
 
+  const wrapperProps = useDragHandle
+    ? { ref: setNodeRef }
+    : { ref: setNodeRef, ...attributes, ...listeners };
+
   return (
-    <div ref={setNodeRef} style={style} {...attributes} {...listeners}>
+    <div {...wrapperProps} style={style}>
       {renderItem(info)}
     </div>
   );
@@ -102,6 +118,7 @@ export function DraggableList<T>({
   renderItem,
   onDragEnd,
   style,
+  containerStyle,
   contentContainerStyle,
   testID,
   ListFooterComponent,
@@ -109,6 +126,8 @@ export function DraggableList<T>({
   ListEmptyComponent,
   showsVerticalScrollIndicator = true,
   enableDesktopWebScrollbar = false,
+  scrollEnabled = true,
+  useDragHandle = false,
   // simultaneousGestureRef is native-only, ignored on web
   onDragBegin,
 }: DraggableListProps<T>) {
@@ -161,52 +180,90 @@ export function DraggableList<T>({
   );
 
   const ids = items.map((item, index) => keyExtractor(item, index));
-  const showCustomScrollbar = enableDesktopWebScrollbar;
+  const showCustomScrollbar = enableDesktopWebScrollbar && scrollEnabled;
+  const wrapperStyle = [
+    { position: "relative" as const },
+    scrollEnabled ? { flex: 1, minHeight: 0 } : null,
+    containerStyle,
+  ];
 
   return (
-    <View style={{ flex: 1, minHeight: 0, position: "relative" }}>
-      <ScrollView
-        ref={scrollViewRef}
-        testID={testID}
-        style={style}
-        contentContainerStyle={contentContainerStyle}
-        showsVerticalScrollIndicator={
-          showCustomScrollbar ? false : showsVerticalScrollIndicator
-        }
-        onLayout={showCustomScrollbar ? scrollbarMetrics.onLayout : undefined}
-        onContentSizeChange={
-          showCustomScrollbar ? scrollbarMetrics.onContentSizeChange : undefined
-        }
-        onScroll={showCustomScrollbar ? scrollbarMetrics.onScroll : undefined}
-        scrollEventThrottle={showCustomScrollbar ? 16 : undefined}
-      >
-        {ListHeaderComponent}
-        {items.length === 0 && ListEmptyComponent}
-        <DndContext
-          sensors={sensors}
-          collisionDetection={closestCenter}
-          modifiers={[restrictToVerticalAxis]}
-          onDragStart={handleDragStart}
-          onDragEnd={handleDragEnd}
+    <View style={wrapperStyle}>
+      {scrollEnabled ? (
+        <ScrollView
+          ref={scrollViewRef}
+          testID={testID}
+          style={style}
+          contentContainerStyle={contentContainerStyle}
+          showsVerticalScrollIndicator={
+            showCustomScrollbar ? false : showsVerticalScrollIndicator
+          }
+          onLayout={showCustomScrollbar ? scrollbarMetrics.onLayout : undefined}
+          onContentSizeChange={
+            showCustomScrollbar ? scrollbarMetrics.onContentSizeChange : undefined
+          }
+          onScroll={showCustomScrollbar ? scrollbarMetrics.onScroll : undefined}
+          scrollEventThrottle={showCustomScrollbar ? 16 : undefined}
         >
-          <SortableContext items={ids} strategy={verticalListSortingStrategy}>
-            {items.map((item, index) => {
-              const id = keyExtractor(item, index);
-              return (
-                <SortableItem
-                  key={id}
-                  id={id}
-                  item={item}
-                  index={index}
-                  renderItem={renderItem}
-                  activeId={activeId}
-                />
-              );
-            })}
-          </SortableContext>
-        </DndContext>
-        {ListFooterComponent}
-      </ScrollView>
+          {ListHeaderComponent}
+          {items.length === 0 && ListEmptyComponent}
+          <DndContext
+            sensors={sensors}
+            collisionDetection={closestCenter}
+            modifiers={[restrictToVerticalAxis]}
+            onDragStart={handleDragStart}
+            onDragEnd={handleDragEnd}
+          >
+            <SortableContext items={ids} strategy={verticalListSortingStrategy}>
+              {items.map((item, index) => {
+                const id = keyExtractor(item, index);
+                return (
+                  <SortableItem
+                    key={id}
+                    id={id}
+                    item={item}
+                    index={index}
+                    renderItem={renderItem}
+                    activeId={activeId}
+                    useDragHandle={useDragHandle}
+                  />
+                );
+              })}
+            </SortableContext>
+          </DndContext>
+          {ListFooterComponent}
+        </ScrollView>
+      ) : (
+        <>
+          {ListHeaderComponent}
+          {items.length === 0 && ListEmptyComponent}
+          <DndContext
+            sensors={sensors}
+            collisionDetection={closestCenter}
+            modifiers={[restrictToVerticalAxis]}
+            onDragStart={handleDragStart}
+            onDragEnd={handleDragEnd}
+          >
+            <SortableContext items={ids} strategy={verticalListSortingStrategy}>
+              {items.map((item, index) => {
+                const id = keyExtractor(item, index);
+                return (
+                  <SortableItem
+                    key={id}
+                    id={id}
+                    item={item}
+                    index={index}
+                    renderItem={renderItem}
+                    activeId={activeId}
+                    useDragHandle={useDragHandle}
+                  />
+                );
+              })}
+            </SortableContext>
+          </DndContext>
+          {ListFooterComponent}
+        </>
+      )}
       <WebDesktopScrollbarOverlay
         enabled={showCustomScrollbar}
         metrics={scrollbarMetrics}

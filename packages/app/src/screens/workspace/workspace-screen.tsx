@@ -35,6 +35,7 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { ExplorerSidebar } from "@/components/explorer-sidebar";
 import { TerminalPane } from "@/components/terminal-pane";
 import { ExplorerSidebarAnimationProvider } from "@/contexts/explorer-sidebar-animation-context";
@@ -62,6 +63,9 @@ import { AgentReadyScreen } from "@/screens/agent/agent-ready-screen";
 import type { ListTerminalsResponse } from "@server/shared/messages";
 import { upsertTerminalListEntry } from "@/utils/terminal-list";
 import { confirmDialog } from "@/utils/confirm-dialog";
+import { deriveSidebarStateBucket } from "@/utils/sidebar-agent-state";
+import { getStatusDotColor } from "@/utils/status-dot-color";
+import { useArchiveAgent } from "@/hooks/use-archive-agent";
 
 const TERMINALS_QUERY_STALE_TIME = 5_000;
 const DROPDOWN_WIDTH = 220;
@@ -358,6 +362,7 @@ function WorkspaceScreenContent({
       return payload;
     },
   });
+  const { archiveAgent, isArchivingAgent } = useArchiveAgent();
 
   useEffect(() => {
     if (!client || !isConnected || !normalizedWorkspaceId.startsWith("/")) {
@@ -371,16 +376,18 @@ function WorkspaceScreenContent({
       if (message.payload.cwd !== normalizedWorkspaceId) {
         return;
       }
-      void queryClient.invalidateQueries({ queryKey: terminalsQueryKey });
-      void queryClient.refetchQueries({ queryKey: terminalsQueryKey, type: "active" });
+
+      queryClient.setQueryData<ListTerminalsPayload>(terminalsQueryKey, (current) => ({
+        cwd: message.payload.cwd,
+        terminals: message.payload.terminals,
+        requestId: current?.requestId ?? `terminals-changed-${Date.now()}`,
+      }));
     });
 
     const unsubscribeStreamExit = client.on("terminal_stream_exit", (message) => {
       if (message.type !== "terminal_stream_exit") {
         return;
       }
-      void queryClient.invalidateQueries({ queryKey: terminalsQueryKey });
-      void queryClient.refetchQueries({ queryKey: terminalsQueryKey, type: "active" });
     });
 
     client.subscribeTerminals({ cwd: normalizedWorkspaceId });
@@ -819,14 +826,10 @@ function WorkspaceScreenContent({
     [handleCreateAgent, handleCreateTerminal]
   );
 
-  const getTabAfterClosingTerminal = useCallback(
-    (terminalId: string): WorkspaceTabTarget | null => {
-      const currentIndex = tabs.findIndex(
-        (tab) => tab.kind === "terminal" && tab.terminalId === terminalId
-      );
-      const nextTabs = tabs.filter(
-        (tab) => !(tab.kind === "terminal" && tab.terminalId === terminalId)
-      );
+  const getTabAfterClosing = useCallback(
+    (tabKey: string): WorkspaceTabTarget | null => {
+      const currentIndex = tabs.findIndex((tab) => tab.key === tabKey);
+      const nextTabs = tabs.filter((tab) => tab.key !== tabKey);
       if (nextTabs.length === 0) {
         return null;
       }
@@ -870,11 +873,21 @@ function WorkspaceScreenContent({
             current === tabKey ? null : current
           );
 
-          if (
-            resolvedTab?.kind === "terminal" &&
-            resolvedTab.terminalId === terminalId
-          ) {
-            const nextTab = getTabAfterClosingTerminal(terminalId);
+          queryClient.setQueryData<ListTerminalsPayload>(
+            terminalsQueryKey,
+            (current) => {
+              if (!current) {
+                return current;
+              }
+              return {
+                ...current,
+                terminals: current.terminals.filter((terminal) => terminal.id !== terminalId),
+              };
+            }
+          );
+
+          if (resolvedTab?.kind === "terminal" && resolvedTab.terminalId === terminalId) {
+            const nextTab = getTabAfterClosing(`terminal:${terminalId}`);
             if (nextTab) {
               navigateToTab(nextTab);
             } else {
@@ -886,17 +899,11 @@ function WorkspaceScreenContent({
               );
             }
           }
-
-          void queryClient.invalidateQueries({ queryKey: terminalsQueryKey });
-          void queryClient.refetchQueries({
-            queryKey: terminalsQueryKey,
-            type: "active",
-          });
         },
       });
     },
     [
-      getTabAfterClosingTerminal,
+      getTabAfterClosing,
       killTerminalMutation,
       navigateToTab,
       normalizedServerId,
@@ -905,6 +912,55 @@ function WorkspaceScreenContent({
       resolvedTab,
       router,
       terminalsQueryKey,
+    ]
+  );
+
+  const handleCloseAgentTab = useCallback(
+    async (agentId: string) => {
+      if (!normalizedServerId || isArchivingAgent({ serverId: normalizedServerId, agentId })) {
+        return;
+      }
+
+      const confirmed = await confirmDialog({
+        title: "Archive agent?",
+        message: "This closes the tab and archives the agent.",
+        confirmLabel: "Archive",
+        cancelLabel: "Cancel",
+        destructive: true,
+      });
+      if (!confirmed) {
+        return;
+      }
+
+      await archiveAgent({ serverId: normalizedServerId, agentId });
+
+      const tabKey = `agent:${agentId}`;
+      setHoveredTabKey((current) => (current === tabKey ? null : current));
+      setHoveredCloseTabKey((current) => (current === tabKey ? null : current));
+
+      if (resolvedTab?.kind === "agent" && resolvedTab.agentId === agentId) {
+        const nextTab = getTabAfterClosing(tabKey);
+        if (nextTab) {
+          navigateToTab(nextTab);
+        } else {
+          router.replace(
+            buildHostWorkspaceRoute(
+              normalizedServerId,
+              normalizedWorkspaceId
+            ) as any
+          );
+        }
+      }
+    },
+    [
+      archiveAgent,
+      getTabAfterClosing,
+      isArchivingAgent,
+      navigateToTab,
+      normalizedServerId,
+      normalizedWorkspaceId,
+      resolvedTab,
+      router,
     ]
   );
 
@@ -959,143 +1015,223 @@ function WorkspaceScreenContent({
 
   return (
     <View style={styles.container}>
-      <ScreenHeader
-        left={
-          <>
-            <SidebarMenuToggle />
-            <Text style={styles.headerTitle} numberOfLines={1}>
-              {headerTitle}
-            </Text>
-          </>
-        }
-        right={
-          <View style={styles.headerRight}>
-            {isMobile ? (
+      <View style={styles.threePaneRow}>
+        <View style={styles.centerColumn}>
+          <ScreenHeader
+            left={
+              <>
+                <SidebarMenuToggle />
+                <Text style={styles.headerTitle} numberOfLines={1}>
+                  {headerTitle}
+                </Text>
+              </>
+            }
+            right={
+              <View style={styles.headerRight}>
+                <HeaderToggleButton
+                  testID="workspace-explorer-toggle"
+                  onPress={handleToggleExplorer}
+                  tooltipLabel="Toggle explorer"
+                  tooltipKeys={["mod", "E"]}
+                  tooltipSide="left"
+                  style={styles.menuButton}
+                  accessible
+                  accessibilityRole="button"
+                  accessibilityLabel={isExplorerOpen ? "Close explorer" : "Open explorer"}
+                  accessibilityState={{ expanded: isExplorerOpen }}
+                >
+                  {isMobile ? (
+                    isGitCheckout ? (
+                      <GitBranch
+                        size={theme.iconSize.lg}
+                        color={
+                          isExplorerOpen
+                            ? theme.colors.foreground
+                            : theme.colors.foregroundMuted
+                        }
+                      />
+                    ) : (
+                      <Folder
+                        size={theme.iconSize.lg}
+                        color={
+                          isExplorerOpen
+                            ? theme.colors.foreground
+                            : theme.colors.foregroundMuted
+                        }
+                      />
+                    )
+                  ) : (
+                    <PanelRight
+                      size={theme.iconSize.md}
+                      color={
+                        isExplorerOpen
+                          ? theme.colors.foreground
+                          : theme.colors.foregroundMuted
+                      }
+                    />
+                  )}
+                </HeaderToggleButton>
+
+                {activeAgent ? (
+                  <DropdownMenu>
+                    <DropdownMenuTrigger
+                      testID="workspace-agent-overflow-menu"
+                      style={styles.menuButton}
+                    >
+                      <MoreVertical
+                        size={isMobile ? theme.iconSize.lg : theme.iconSize.md}
+                        color={theme.colors.foregroundMuted}
+                      />
+                    </DropdownMenuTrigger>
+                    <DropdownMenuContent
+                      align="end"
+                      width={DROPDOWN_WIDTH}
+                      testID="workspace-agent-overflow-content"
+                    >
+                      <DropdownMenuItem
+                        testID="workspace-agent-overflow-open-chat"
+                        description="Open this agent with the full chat header"
+                        onSelect={handleOpenAgentChatView}
+                      >
+                        Open chat view
+                      </DropdownMenuItem>
+                    </DropdownMenuContent>
+                  </DropdownMenu>
+                ) : null}
+              </View>
+            }
+          />
+
+          {isMobile ? (
+            <View style={styles.mobileTabsRow} testID="workspace-tabs-row">
               <Pressable
                 ref={tabSwitcherAnchorRef}
                 style={({ hovered, pressed }) => [
                   styles.switcherTrigger,
-                  (hovered || pressed) && styles.switcherTriggerActive,
+                  (hovered || pressed || isTabSwitcherOpen) && styles.switcherTriggerActive,
+                  { borderWidth: 0, borderColor: "transparent" },
+                  Platform.OS === "web"
+                    ? {
+                        outlineStyle: "solid",
+                        outlineWidth: 0,
+                        outlineColor: "transparent",
+                      }
+                    : null,
                 ]}
                 onPress={() => setIsTabSwitcherOpen(true)}
               >
-                <Text style={styles.switcherTriggerText} numberOfLines={1}>
-                  {activeTabLabel}
-                </Text>
+                <View style={styles.switcherTriggerLeft}>
+                  <View style={styles.switcherTriggerIcon} testID="workspace-active-tab-icon">
+                    {(() => {
+                      const activeDescriptor = tabs.find((tab) => tab.key === activeTabKey) ?? null;
+                      if (!activeDescriptor) {
+                        return <View style={styles.tabIcon}><Bot size={14} color={theme.colors.foregroundMuted} /></View>;
+                      }
+
+                      if (activeDescriptor.kind === "terminal") {
+                        return <Terminal size={14} color={theme.colors.foreground} />;
+                      }
+
+                      const tabAgent = agentsById.get(activeDescriptor.agentId) ?? null;
+                      const tabAgentStatusBucket = tabAgent
+                        ? deriveSidebarStateBucket({
+                            status: tabAgent.status,
+                            pendingPermissionCount: tabAgent.pendingPermissions.length,
+                            requiresAttention: tabAgent.requiresAttention,
+                            attentionReason: tabAgent.attentionReason,
+                          })
+                        : null;
+                      const tabAgentStatusColor =
+                        tabAgentStatusBucket === null
+                          ? null
+                          : getStatusDotColor({
+                              theme,
+                              bucket: tabAgentStatusBucket,
+                              showDoneAsInactive: false,
+                            });
+
+                      return (
+                        <View style={styles.tabAgentIconWrapper}>
+                          {activeDescriptor.provider === "claude" ? (
+                            <ClaudeIcon size={14} color={theme.colors.foreground} />
+                          ) : activeDescriptor.provider === "codex" ? (
+                            <CodexIcon size={14} color={theme.colors.foreground} />
+                          ) : (
+                            <Bot size={14} color={theme.colors.foreground} />
+                          )}
+                          {tabAgentStatusColor ? (
+                            <View
+                              style={[
+                                styles.tabStatusDot,
+                                {
+                                  backgroundColor: tabAgentStatusColor,
+                                  borderColor: theme.colors.surface0,
+                                },
+                              ]}
+                            />
+                          ) : null}
+                        </View>
+                      );
+                    })()}
+                  </View>
+
+                  <Text style={styles.switcherTriggerText} numberOfLines={1}>
+                    {activeTabLabel}
+                  </Text>
+                </View>
+
                 <ChevronDown size={theme.iconSize.sm} color={theme.colors.foregroundMuted} />
               </Pressable>
-            ) : null}
 
-            <HeaderToggleButton
-              testID="workspace-explorer-toggle"
-              onPress={handleToggleExplorer}
-              tooltipLabel="Toggle explorer"
-              tooltipKeys={["mod", "E"]}
-              tooltipSide="left"
-              style={styles.menuButton}
-              accessible
-              accessibilityRole="button"
-              accessibilityLabel={isExplorerOpen ? "Close explorer" : "Open explorer"}
-              accessibilityState={{ expanded: isExplorerOpen }}
-            >
-              {isMobile ? (
-                isGitCheckout ? (
-                  <GitBranch
-                    size={theme.iconSize.lg}
-                    color={
-                      isExplorerOpen
-                        ? theme.colors.foreground
-                        : theme.colors.foregroundMuted
-                    }
-                  />
-                ) : (
-                  <Folder
-                    size={theme.iconSize.lg}
-                    color={
-                      isExplorerOpen
-                        ? theme.colors.foreground
-                        : theme.colors.foregroundMuted
-                    }
-                  />
-                )
-              ) : (
-                <PanelRight
-                  size={theme.iconSize.md}
-                  color={
-                    isExplorerOpen
-                      ? theme.colors.foreground
-                      : theme.colors.foregroundMuted
-                  }
-                />
-              )}
-            </HeaderToggleButton>
-
-            <DropdownMenu>
-              <DropdownMenuTrigger
-                testID="workspace-new-tab"
-                style={({ hovered, pressed, open }) => [
-                  styles.newTabButton,
-                  (hovered || pressed || open) && styles.newTabButtonActive,
-                ]}
-              >
-                <Plus size={theme.iconSize.sm} color={theme.colors.foregroundMuted} />
-                <Text style={styles.newTabButtonText}>New tab</Text>
-                <ChevronDown size={theme.iconSize.sm} color={theme.colors.foregroundMuted} />
-              </DropdownMenuTrigger>
-              <DropdownMenuContent
-                align="end"
-                width={DROPDOWN_WIDTH}
-                testID="workspace-new-tab-content"
-              >
-                <DropdownMenuItem
-                  testID="workspace-new-tab-agent-option"
-                  description="Open the draft agent flow for this workspace"
-                  onSelect={() => {
-                    handleSelectNewTabOption(NEW_TAB_AGENT_OPTION_ID);
-                  }}
-                >
-                  Agent tab
-                </DropdownMenuItem>
-                <DropdownMenuItem
-                  testID="workspace-new-tab-terminal-option"
-                  description="Create a new terminal in this workspace"
-                  onSelect={() => {
-                    handleSelectNewTabOption(NEW_TAB_TERMINAL_OPTION_ID);
-                  }}
-                >
-                  Terminal tab
-                </DropdownMenuItem>
-              </DropdownMenuContent>
-            </DropdownMenu>
-
-            {activeAgent ? (
-              <DropdownMenu>
-                <DropdownMenuTrigger
-                  testID="workspace-agent-overflow-menu"
-                  style={styles.menuButton}
-                >
-                  <MoreVertical
-                    size={isMobile ? theme.iconSize.lg : theme.iconSize.md}
-                    color={theme.colors.foregroundMuted}
-                  />
-                </DropdownMenuTrigger>
-                <DropdownMenuContent
-                  align="end"
-                  width={DROPDOWN_WIDTH}
-                  testID="workspace-agent-overflow-content"
-                >
-                  <DropdownMenuItem
-                    testID="workspace-agent-overflow-open-chat"
-                    description="Open this agent with the full chat header"
-                    onSelect={handleOpenAgentChatView}
+              <View style={styles.mobileTabsActions}>
+                <Tooltip delayDuration={0} enabledOnDesktop enabledOnMobile={false}>
+                  <TooltipTrigger
+                    testID="workspace-new-agent-tab"
+                    onPress={() => handleSelectNewTabOption(NEW_TAB_AGENT_OPTION_ID)}
+                    accessibilityRole="button"
+                    accessibilityLabel="New agent tab"
+                    style={({ hovered, pressed }) => [
+                      styles.newTabActionButton,
+                      (hovered || pressed) && styles.newTabActionButtonHovered,
+                    ]}
                   >
-                    Open chat view
-                  </DropdownMenuItem>
-                </DropdownMenuContent>
-              </DropdownMenu>
-            ) : null}
+                    <Plus size={theme.iconSize.sm} color={theme.colors.foregroundMuted} />
+                  </TooltipTrigger>
+                  <TooltipContent side="bottom" align="end" offset={8}>
+                    <Text style={styles.newTabTooltipText}>New agent tab</Text>
+                  </TooltipContent>
+                </Tooltip>
 
-            {isMobile ? (
+                <Tooltip delayDuration={0} enabledOnDesktop enabledOnMobile={false}>
+                  <TooltipTrigger
+                    testID="workspace-new-terminal-tab"
+                    onPress={() => handleSelectNewTabOption(NEW_TAB_TERMINAL_OPTION_ID)}
+                    disabled={createTerminalMutation.isPending}
+                    accessibilityRole="button"
+                    accessibilityLabel="New terminal tab"
+                    style={({ hovered, pressed }) => [
+                      styles.newTabActionButton,
+                      createTerminalMutation.isPending && styles.newTabActionButtonDisabled,
+                      (hovered || pressed) && styles.newTabActionButtonHovered,
+                    ]}
+                  >
+                    {createTerminalMutation.isPending ? (
+                      <ActivityIndicator size="small" color={theme.colors.foregroundMuted} />
+                    ) : (
+                      <View style={styles.terminalPlusIcon}>
+                        <Terminal size={theme.iconSize.sm} color={theme.colors.foregroundMuted} />
+                        <View style={styles.terminalPlusBadge}>
+                          <Plus size={10} color={theme.colors.foregroundMuted} />
+                        </View>
+                      </View>
+                    )}
+                  </TooltipTrigger>
+                  <TooltipContent side="bottom" align="end" offset={8}>
+                    <Text style={styles.newTabTooltipText}>New terminal tab</Text>
+                  </TooltipContent>
+                </Tooltip>
+              </View>
+
               <Combobox
                 options={tabSwitcherOptions}
                 value={activeTabKey}
@@ -1107,132 +1243,232 @@ function WorkspaceScreenContent({
                 onOpenChange={setIsTabSwitcherOpen}
                 anchorRef={tabSwitcherAnchorRef}
               />
-            ) : null}
-          </View>
-        }
-      />
-
-      {!isMobile ? (
-        <View style={styles.tabsContainer}>
-          <ScrollView
-            horizontal
-            style={styles.tabsScroll}
-            contentContainerStyle={styles.tabsContent}
-            showsHorizontalScrollIndicator={false}
-          >
-            {tabs.map((tab) => {
-              const isActive = tab.key === activeTabKey;
-              const isTabHovered = hoveredTabKey === tab.key;
-              const isCloseHovered = hoveredCloseTabKey === tab.key;
-              const isClosingTerminal =
-                tab.kind === "terminal" &&
-                killTerminalMutation.isPending &&
-                killTerminalMutation.variables === tab.terminalId;
-              const shouldShowCloseButton =
-                tab.kind === "terminal" &&
-                (isTabHovered || isCloseHovered || isClosingTerminal);
-              const iconColor = isActive
-                ? theme.colors.foreground
-                : theme.colors.foregroundMuted;
-              const icon =
-                tab.kind === "agent" ? (
-                  tab.provider === "claude" ? (
-                    <ClaudeIcon size={14} color={iconColor} />
-                  ) : tab.provider === "codex" ? (
-                    <CodexIcon size={14} color={iconColor} />
-                  ) : (
-                    <Bot size={14} color={iconColor} />
-                  )
-                ) : (
-                  <Terminal size={14} color={iconColor} />
-                );
-
-              return (
-                <Pressable
-                  key={tab.key}
-                  testID={`workspace-tab-${tab.key}`}
-                  style={({ hovered, pressed }) => [
-                    styles.tab,
-                    isActive && styles.tabActive,
-                    (hovered || pressed) && styles.tabHovered,
-                  ]}
-                  onHoverIn={() => {
-                    setHoveredTabKey(tab.key);
-                  }}
-                  onHoverOut={() => {
-                    setHoveredTabKey((current) =>
-                      current === tab.key ? null : current
-                    );
-                  }}
-                  onPress={() => {
-                    if (tab.kind === "agent") {
-                      navigateToTab({ kind: "agent", agentId: tab.agentId });
-                      return;
-                    }
-                    navigateToTab({
-                      kind: "terminal",
-                      terminalId: tab.terminalId,
+            </View>
+          ) : (
+            <View style={styles.tabsContainer} testID="workspace-tabs-row">
+              <ScrollView
+                horizontal
+                testID="workspace-tabs-scroll"
+                style={styles.tabsScroll}
+                contentContainerStyle={styles.tabsContent}
+                showsHorizontalScrollIndicator={false}
+              >
+                {tabs.map((tab) => {
+                  const isActive = tab.key === activeTabKey;
+                  const tabAgent = tab.kind === "agent" ? agentsById.get(tab.agentId) ?? null : null;
+                  const isTabHovered = hoveredTabKey === tab.key;
+                  const isCloseHovered = hoveredCloseTabKey === tab.key;
+                  const isClosingAgent =
+                    tab.kind === "agent" &&
+                    isArchivingAgent({
+                      serverId: normalizedServerId,
+                      agentId: tab.agentId,
                     });
-                  }}
-                >
-                  <View style={styles.tabIcon}>{icon}</View>
-                  <Text
-                    style={[
-                      styles.tabLabel,
-                      isActive && styles.tabLabelActive,
-                      shouldShowCloseButton && styles.tabLabelWithCloseButton,
-                    ]}
-                    numberOfLines={1}
-                  >
-                    {tab.label}
-                  </Text>
-                  {tab.kind === "terminal" ? (
+                  const isClosingTerminal =
+                    tab.kind === "terminal" &&
+                    killTerminalMutation.isPending &&
+                    killTerminalMutation.variables === tab.terminalId;
+                  const isClosingTab = isClosingAgent || isClosingTerminal;
+                  const shouldShowCloseButton = true;
+                  const iconColor = isActive
+                    ? theme.colors.foreground
+                    : theme.colors.foregroundMuted;
+                  const tabAgentStatusBucket = tabAgent
+                    ? deriveSidebarStateBucket({
+                        status: tabAgent.status,
+                        pendingPermissionCount: tabAgent.pendingPermissions.length,
+                        requiresAttention: tabAgent.requiresAttention,
+                        attentionReason: tabAgent.attentionReason,
+                      })
+                    : null;
+                  const tabAgentStatusColor =
+                    tabAgentStatusBucket === null
+                      ? null
+                      : getStatusDotColor({
+                          theme,
+                          bucket: tabAgentStatusBucket,
+                          showDoneAsInactive: false,
+                        });
+                  const icon =
+                    tab.kind === "agent" ? (
+                      <View style={styles.tabAgentIconWrapper}>
+                        {tab.provider === "claude" ? (
+                          <ClaudeIcon size={14} color={iconColor} />
+                        ) : tab.provider === "codex" ? (
+                          <CodexIcon size={14} color={iconColor} />
+                        ) : (
+                          <Bot size={14} color={iconColor} />
+                        )}
+                        {tabAgentStatusColor ? (
+                          <View
+                            style={[
+                              styles.tabStatusDot,
+                              {
+                                backgroundColor: tabAgentStatusColor,
+                                borderColor: theme.colors.surface0,
+                              },
+                            ]}
+                          />
+                        ) : null}
+                      </View>
+                    ) : (
+                      <Terminal size={14} color={iconColor} />
+                    );
+
+                  return (
                     <Pressable
-                      testID={`workspace-terminal-close-${tab.terminalId}`}
-                      pointerEvents={shouldShowCloseButton ? "auto" : "none"}
-                      disabled={!shouldShowCloseButton || isClosingTerminal}
+                      key={tab.key}
+                      testID={`workspace-tab-${tab.key}`}
+                      style={({ hovered, pressed }) => [
+                        styles.tab,
+                        isActive && styles.tabActive,
+                        (hovered || pressed || isCloseHovered) && styles.tabHovered,
+                      ]}
                       onHoverIn={() => {
-                        setHoveredCloseTabKey(tab.key);
+                        setHoveredTabKey(tab.key);
                       }}
                       onHoverOut={() => {
-                        setHoveredCloseTabKey((current) =>
+                        setHoveredTabKey((current) =>
                           current === tab.key ? null : current
                         );
                       }}
-                      onPress={(event) => {
-                        event.stopPropagation();
-                        void handleCloseTerminalTab(tab.terminalId);
+                      onPress={() => {
+                        if (tab.kind === "agent") {
+                          navigateToTab({ kind: "agent", agentId: tab.agentId });
+                          return;
+                        }
+                        navigateToTab({
+                          kind: "terminal",
+                          terminalId: tab.terminalId,
+                        });
                       }}
-                      style={({ hovered, pressed }) => [
-                        styles.tabCloseButton,
-                        shouldShowCloseButton
-                          ? styles.tabCloseButtonShown
-                          : styles.tabCloseButtonHidden,
-                        (hovered || pressed) && styles.tabCloseButtonActive,
-                      ]}
                     >
-                      {isClosingTerminal ? (
-                        <ActivityIndicator size={12} color={theme.colors.foregroundMuted} />
-                      ) : (
-                        <X size={12} color={theme.colors.foregroundMuted} />
-                      )}
+                      <View style={styles.tabIcon}>{icon}</View>
+                      <Text
+                        style={[
+                          styles.tabLabel,
+                          isActive && styles.tabLabelActive,
+                          shouldShowCloseButton && styles.tabLabelWithCloseButton,
+                        ]}
+                        numberOfLines={1}
+                      >
+                        {tab.label}
+                      </Text>
+                      <Pressable
+                        testID={
+                          tab.kind === "agent"
+                            ? `workspace-agent-close-${tab.agentId}`
+                            : `workspace-terminal-close-${tab.terminalId}`
+                        }
+                        pointerEvents={shouldShowCloseButton ? "auto" : "none"}
+                        disabled={!shouldShowCloseButton || isClosingTab}
+                        onHoverIn={() => {
+                          setHoveredTabKey(tab.key);
+                          setHoveredCloseTabKey(tab.key);
+                        }}
+                        onHoverOut={() => {
+                          setHoveredTabKey((current) =>
+                            current === tab.key ? null : current
+                          );
+                          setHoveredCloseTabKey((current) =>
+                            current === tab.key ? null : current
+                          );
+                        }}
+                        onPress={(event) => {
+                          event.stopPropagation?.();
+                          if (tab.kind === "agent") {
+                            void handleCloseAgentTab(tab.agentId);
+                            return;
+                          }
+                          void handleCloseTerminalTab(tab.terminalId);
+                        }}
+                        style={({ hovered, pressed }) => [
+                          styles.tabCloseButton,
+                          shouldShowCloseButton
+                            ? styles.tabCloseButtonShown
+                            : styles.tabCloseButtonHidden,
+                          (hovered || pressed) && styles.tabCloseButtonActive,
+                        ]}
+                      >
+                        {isClosingTab ? (
+                          <ActivityIndicator
+                            size={12}
+                            color={theme.colors.foregroundMuted}
+                          />
+                        ) : (
+                          <X size={12} color={theme.colors.foregroundMuted} />
+                        )}
+                      </Pressable>
                     </Pressable>
-                  ) : null}
-                </Pressable>
-              );
-            })}
-          </ScrollView>
-        </View>
-      ) : null}
+                  );
+                })}
+              </ScrollView>
+              <View style={styles.tabsActions}>
+                <Tooltip delayDuration={0} enabledOnDesktop enabledOnMobile={false}>
+                  <TooltipTrigger
+                    testID="workspace-new-agent-tab"
+                    onPress={() => handleSelectNewTabOption(NEW_TAB_AGENT_OPTION_ID)}
+                    accessibilityRole="button"
+                    accessibilityLabel="New agent tab"
+                    style={({ hovered, pressed }) => [
+                      styles.newTabActionButton,
+                      (hovered || pressed) && styles.newTabActionButtonHovered,
+                    ]}
+                  >
+                    <Plus size={theme.iconSize.sm} color={theme.colors.foregroundMuted} />
+                  </TooltipTrigger>
+                  <TooltipContent side="bottom" align="end" offset={8}>
+                    <Text style={styles.newTabTooltipText}>New agent tab</Text>
+                  </TooltipContent>
+                </Tooltip>
+                <Tooltip delayDuration={0} enabledOnDesktop enabledOnMobile={false}>
+                  <TooltipTrigger
+                    testID="workspace-new-terminal-tab"
+                    onPress={() => handleSelectNewTabOption(NEW_TAB_TERMINAL_OPTION_ID)}
+                    disabled={createTerminalMutation.isPending}
+                    accessibilityRole="button"
+                    accessibilityLabel="New terminal tab"
+                    style={({ hovered, pressed }) => [
+                      styles.newTabActionButton,
+                      createTerminalMutation.isPending && styles.newTabActionButtonDisabled,
+                      (hovered || pressed) && styles.newTabActionButtonHovered,
+                    ]}
+                  >
+                    {createTerminalMutation.isPending ? (
+                      <ActivityIndicator
+                        size="small"
+                        color={theme.colors.foregroundMuted}
+                      />
+                    ) : (
+                      <View style={styles.terminalPlusIcon}>
+                        <Terminal
+                          size={theme.iconSize.sm}
+                          color={theme.colors.foregroundMuted}
+                        />
+                        <View style={styles.terminalPlusBadge}>
+                          <Plus size={10} color={theme.colors.foregroundMuted} />
+                        </View>
+                      </View>
+                    )}
+                  </TooltipTrigger>
+                  <TooltipContent side="bottom" align="end" offset={8}>
+                    <Text style={styles.newTabTooltipText}>New terminal tab</Text>
+                  </TooltipContent>
+                </Tooltip>
+              </View>
+            </View>
+          )}
 
-      <View style={styles.mainRow}>
-        {isMobile ? (
-          <GestureDetector gesture={explorerOpenGesture} touchAction="pan-y">
-            <View style={styles.content}>{renderContent()}</View>
-          </GestureDetector>
-        ) : (
-          <View style={styles.content}>{renderContent()}</View>
-        )}
+          <View style={styles.centerContent}>
+            {isMobile ? (
+              <GestureDetector gesture={explorerOpenGesture} touchAction="pan-y">
+                <View style={styles.content}>{renderContent()}</View>
+              </GestureDetector>
+            ) : (
+              <View style={styles.content}>{renderContent()}</View>
+            )}
+          </View>
+        </View>
 
         <ExplorerSidebar
           serverId={normalizedServerId}
@@ -1249,6 +1485,16 @@ const styles = StyleSheet.create((theme) => ({
   container: {
     flex: 1,
     backgroundColor: theme.colors.surface0,
+  },
+  threePaneRow: {
+    flex: 1,
+    minHeight: 0,
+    flexDirection: "row",
+    alignItems: "stretch",
+  },
+  centerColumn: {
+    flex: 1,
+    minHeight: 0,
   },
   headerTitle: {
     flex: 1,
@@ -1268,50 +1514,108 @@ const styles = StyleSheet.create((theme) => ({
     padding: theme.spacing[3],
     borderRadius: theme.borderRadius.lg,
   },
-  newTabButton: {
+  newTabActions: {
     flexDirection: "row",
     alignItems: "center",
     gap: theme.spacing[1],
-    paddingHorizontal: theme.spacing[2],
-    paddingVertical: theme.spacing[1],
+  },
+  newTabActionButton: {
+    width: 30,
+    height: 30,
     borderRadius: theme.borderRadius.md,
     borderWidth: theme.borderWidth[1],
     borderColor: theme.colors.border,
+    backgroundColor: theme.colors.surface1,
+    alignItems: "center",
+    justifyContent: "center",
   },
-  newTabButtonActive: {
+  newTabActionButtonHovered: {
     backgroundColor: theme.colors.surface2,
   },
-  newTabButtonText: {
-    color: theme.colors.foregroundMuted,
-    fontSize: theme.fontSize.sm,
+  newTabActionButtonDisabled: {
+    opacity: 0.6,
   },
-  switcherTrigger: {
-    maxWidth: 220,
+  newTabTooltipText: {
+    fontSize: theme.fontSize.sm,
+    color: theme.colors.popoverForeground,
+  },
+  terminalPlusIcon: {
+    position: "relative",
+    width: theme.iconSize.sm,
+    height: theme.iconSize.sm,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  terminalPlusBadge: {
+    position: "absolute",
+    right: -6,
+    bottom: -6,
+    width: 14,
+    height: 14,
+    borderRadius: 7,
+    backgroundColor: theme.colors.surface1,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  mobileTabsRow: {
+    borderBottomWidth: 1,
+    borderBottomColor: theme.colors.border,
+    backgroundColor: theme.colors.surface0,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: theme.spacing[2],
+    paddingHorizontal: theme.spacing[2],
+    paddingVertical: theme.spacing[1],
+  },
+  mobileTabsActions: {
     flexDirection: "row",
     alignItems: "center",
     gap: theme.spacing[1],
+  },
+  switcherTrigger: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: theme.spacing[1],
+    flex: 1,
+    minWidth: 0,
     paddingHorizontal: theme.spacing[2],
     paddingVertical: theme.spacing[1],
     borderRadius: theme.borderRadius.md,
     borderWidth: theme.borderWidth[1],
     borderColor: theme.colors.border,
+    justifyContent: "space-between",
   },
   switcherTriggerActive: {
     backgroundColor: theme.colors.surface2,
   },
+  switcherTriggerLeft: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: theme.spacing[1],
+    flex: 1,
+    minWidth: 0,
+  },
+  switcherTriggerIcon: {
+    flexShrink: 0,
+  },
   switcherTriggerText: {
     minWidth: 0,
-    flexShrink: 1,
-    color: theme.colors.foregroundMuted,
+    flex: 1,
+    color: theme.colors.foreground,
     fontSize: theme.fontSize.sm,
   },
   tabsContainer: {
     borderBottomWidth: 1,
     borderBottomColor: theme.colors.border,
     backgroundColor: theme.colors.surface0,
+    flexDirection: "row",
+    alignItems: "center",
   },
   tabsScroll: {
     flex: 1,
+    minWidth: 0,
   },
   tabsContent: {
     flexDirection: "row",
@@ -1320,10 +1624,16 @@ const styles = StyleSheet.create((theme) => ({
     paddingHorizontal: theme.spacing[2],
     paddingVertical: theme.spacing[1],
   },
-  mainRow: {
+  tabsActions: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: theme.spacing[1],
+    paddingRight: theme.spacing[2],
+    paddingVertical: theme.spacing[1],
+  },
+  centerContent: {
     flex: 1,
     minHeight: 0,
-    flexDirection: "row",
   },
   tab: {
     paddingHorizontal: theme.spacing[3],
@@ -1336,6 +1646,22 @@ const styles = StyleSheet.create((theme) => ({
   },
   tabIcon: {
     flexShrink: 0,
+  },
+  tabAgentIconWrapper: {
+    position: "relative",
+    width: 14,
+    height: 14,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  tabStatusDot: {
+    position: "absolute",
+    right: -2,
+    bottom: -2,
+    width: 7,
+    height: 7,
+    borderRadius: theme.borderRadius.full,
+    borderWidth: 1,
   },
   tabActive: {
     backgroundColor: theme.colors.surface2,
@@ -1351,7 +1677,7 @@ const styles = StyleSheet.create((theme) => ({
     fontWeight: theme.fontWeight.normal,
   },
   tabLabelWithCloseButton: {
-    paddingRight: theme.spacing[1],
+    paddingRight: 0,
   },
   tabLabelActive: {
     color: theme.colors.foreground,
@@ -1359,7 +1685,7 @@ const styles = StyleSheet.create((theme) => ({
   tabCloseButton: {
     width: 18,
     height: 18,
-    marginLeft: theme.spacing[1],
+    marginLeft: 0,
     borderRadius: theme.borderRadius.sm,
     alignItems: "center",
     justifyContent: "center",

@@ -35,6 +35,7 @@ export function createTerminalManager(): TerminalManager {
   const terminalExitUnsubscribeById = new Map<string, () => void>();
   const terminalsChangedListeners = new Set<TerminalsChangedListener>();
   const defaultEnvByRootCwd = new Map<string, Record<string, string>>();
+  const knownDirectories = new Set<string>();
 
   function assertAbsolutePath(cwd: string): void {
     if (!cwd.startsWith("/")) {
@@ -134,8 +135,12 @@ export function createTerminalManager(): TerminalManager {
     async getTerminals(cwd: string): Promise<TerminalSession[]> {
       assertAbsolutePath(cwd);
 
-      let terminals = terminalsByCwd.get(cwd);
-      if (!terminals || terminals.length === 0) {
+      const terminals = terminalsByCwd.get(cwd);
+      if (terminals && terminals.length > 0) {
+        return terminals;
+      }
+
+      if (!knownDirectories.has(cwd)) {
         const inheritedEnv = resolveDefaultEnvForCwd(cwd);
         const session = registerSession(
           await createTerminal({
@@ -144,11 +149,14 @@ export function createTerminalManager(): TerminalManager {
             ...(inheritedEnv ? { env: inheritedEnv } : {}),
           })
         );
-        terminals = [session];
-        terminalsByCwd.set(cwd, terminals);
+        const created = [session];
+        terminalsByCwd.set(cwd, created);
+        knownDirectories.add(cwd);
         emitTerminalsChanged({ cwd });
+        return created;
       }
-      return terminals;
+
+      return [];
     },
 
     async createTerminal(options: {
@@ -158,6 +166,7 @@ export function createTerminalManager(): TerminalManager {
     }): Promise<TerminalSession> {
       assertAbsolutePath(options.cwd);
 
+      knownDirectories.add(options.cwd);
       const terminals = terminalsByCwd.get(options.cwd) ?? [];
       const defaultName = `Terminal ${terminals.length + 1}`;
       const inheritedEnv = resolveDefaultEnvForCwd(options.cwd);
@@ -194,13 +203,14 @@ export function createTerminalManager(): TerminalManager {
     },
 
     listDirectories(): string[] {
-      return Array.from(terminalsByCwd.keys());
+      return Array.from(knownDirectories);
     },
 
     killAll(): void {
       for (const id of Array.from(terminalsById.keys())) {
         removeSessionById(id, { kill: true });
       }
+      knownDirectories.clear();
     },
 
     subscribeTerminalsChanged(listener: TerminalsChangedListener): () => void {

@@ -6,6 +6,7 @@ import Animated, {
   interpolate,
   Extrapolation,
   runOnJS,
+  useSharedValue,
 } from 'react-native-reanimated'
 import { Gesture, GestureDetector } from 'react-native-gesture-handler'
 import { StyleSheet, UnistylesRuntime, useUnistyles } from 'react-native-unistyles'
@@ -127,6 +128,8 @@ export function LeftSidebar({ selectedAgentId }: LeftSidebarProps) {
   } = useSidebarAnimation()
   const dragHandlers = useTauriDragHandlers()
   const trafficLightPadding = useTrafficLightPadding()
+  const closeTouchStartX = useSharedValue(0)
+  const closeTouchStartY = useSharedValue(0)
 
   // Track user-initiated refresh to avoid showing spinner on background revalidation
   const [isManualRefresh, setIsManualRefresh] = useState(false)
@@ -236,17 +239,47 @@ export function LeftSidebar({ selectedAgentId }: LeftSidebarProps) {
   )
 
   // Close gesture (swipe left to close when sidebar is open)
-  // Only activates on leftward swipe, fails on rightward or vertical movement
-  // This mirrors the explorer-sidebar pattern for the right sidebar
   const closeGesture = Gesture.Pan()
     .withRef(closeGestureRef)
     .enabled(isOpen)
-    // Only activate on leftward swipe (negative X)
-    .activeOffsetX(-15)
-    // Fail on rightward movement (allow internal list scrolling)
-    .failOffsetX(10)
-    // Fail if vertical movement happens first (allow vertical scroll)
-    .failOffsetY([-10, 10])
+    // Use manual activation so child views keep touch streams unless we detect
+    // an intentional left-swipe close (mirrors explorer-sidebar pattern).
+    .manualActivation(true)
+    .onTouchesDown((event) => {
+      const touch = event.changedTouches[0]
+      if (!touch) {
+        return
+      }
+      closeTouchStartX.value = touch.absoluteX
+      closeTouchStartY.value = touch.absoluteY
+    })
+    .onTouchesMove((event, stateManager) => {
+      const touch = event.changedTouches[0]
+      if (!touch || event.numberOfTouches !== 1) {
+        stateManager.fail()
+        return
+      }
+
+      const deltaX = touch.absoluteX - closeTouchStartX.value
+      const deltaY = touch.absoluteY - closeTouchStartY.value
+      const absDeltaX = Math.abs(deltaX)
+      const absDeltaY = Math.abs(deltaY)
+
+      // Fail quickly on clear rightward or vertical intent so child views keep control.
+      if (deltaX >= 10) {
+        stateManager.fail()
+        return
+      }
+      if (absDeltaY > 10 && absDeltaY > absDeltaX) {
+        stateManager.fail()
+        return
+      }
+
+      // Activate only on intentional leftward movement.
+      if (deltaX <= -15 && absDeltaX > absDeltaY) {
+        stateManager.activate()
+      }
+    })
     .onStart(() => {
       isGesturing.value = true
     })

@@ -9,20 +9,21 @@ import {
   type ReactElement,
   type MutableRefObject,
 } from 'react'
-import { router, usePathname } from 'expo-router'
+import { router, useSegments } from 'expo-router'
 import { StyleSheet, UnistylesRuntime, useUnistyles } from 'react-native-unistyles'
 import { type GestureType } from 'react-native-gesture-handler'
 import { ChevronDown, ChevronRight } from 'lucide-react-native'
 import { DraggableList, type DraggableRenderItemInfo } from './draggable-list'
 import { getHostRuntimeStore, isHostRuntimeConnected } from '@/runtime/host-runtime'
 import { projectIconQueryKey } from '@/hooks/use-project-icon-query'
-import { buildHostWorkspaceRoute, parseHostWorkspaceRouteFromPathname } from '@/utils/host-routes'
+import { buildHostWorkspaceRoute } from '@/utils/host-routes'
 import {
   type SidebarProjectEntry,
   type SidebarWorkspaceEntry,
 } from '@/hooks/use-sidebar-agents-list'
 import { useSidebarOrderStore } from '@/stores/sidebar-order-store'
 import { formatTimeAgo } from '@/utils/time'
+import type { SidebarStateBucket } from '@/utils/sidebar-agent-state'
 
 type SidebarTreeRow =
   | {
@@ -68,7 +69,6 @@ interface ProjectRowProps {
 
 interface WorkspaceRowProps {
   workspace: SidebarWorkspaceEntry
-  compact?: boolean
   onPress: () => void
   onLongPress: () => void
 }
@@ -116,21 +116,23 @@ function resolveWorkspaceCreatedAtLabel(workspace: SidebarWorkspaceEntry): strin
   return formatTimeAgo(workspace.createdAt)
 }
 
-function ProjectStatusDot({ bucket }: { bucket: SidebarProjectEntry['statusBucket'] }) {
+function resolveStatusDotColor(input: { theme: ReturnType<typeof useUnistyles>['theme']; bucket: SidebarStateBucket }) {
+  const { theme, bucket } = input
+  return bucket === 'needs_input'
+    ? theme.colors.palette.amber[500]
+    : bucket === 'failed'
+      ? theme.colors.palette.red[500]
+      : bucket === 'running'
+        ? theme.colors.palette.blue[500]
+        : bucket === 'attention'
+          ? theme.colors.palette.green[500]
+          : theme.colors.border
+}
+
+function WorkspaceStatusDot({ bucket }: { bucket: SidebarWorkspaceEntry['statusBucket'] }) {
   const { theme } = useUnistyles()
-
-  const color =
-    bucket === 'needs_input'
-      ? theme.colors.palette.amber[500]
-      : bucket === 'failed'
-        ? theme.colors.palette.red[500]
-        : bucket === 'running'
-          ? theme.colors.palette.blue[500]
-          : bucket === 'attention'
-            ? theme.colors.palette.green[500]
-            : theme.colors.border
-
-  return <View style={[styles.projectStatusDot, { backgroundColor: color }]} />
+  const color = resolveStatusDotColor({ theme, bucket })
+  return <View style={[styles.workspaceStatusDot, { backgroundColor: color }]} />
 }
 
 function ProjectRow({
@@ -185,19 +187,15 @@ function ProjectRow({
           </View>
         )}
 
-        <ProjectStatusDot bucket={project.statusBucket} />
-
         <Text style={styles.projectTitle} numberOfLines={1}>
           {displayName}
         </Text>
       </View>
-
-      <Text style={styles.projectCountText}>{project.workspaces.length}</Text>
     </Pressable>
   )
 }
 
-function WorkspaceRow({ workspace, compact = false, onPress, onLongPress }: WorkspaceRowProps) {
+function WorkspaceRow({ workspace, onPress, onLongPress }: WorkspaceRowProps) {
   const didLongPressRef = useRef(false)
   const createdAtLabel = resolveWorkspaceCreatedAtLabel(workspace)
 
@@ -218,7 +216,6 @@ function WorkspaceRow({ workspace, compact = false, onPress, onLongPress }: Work
     <Pressable
       style={({ pressed, hovered = false }) => [
         styles.workspaceRow,
-        compact && styles.workspaceRowCompact,
         hovered && styles.workspaceRowHovered,
         pressed && styles.workspaceRowPressed,
       ]}
@@ -227,9 +224,12 @@ function WorkspaceRow({ workspace, compact = false, onPress, onLongPress }: Work
       delayLongPress={200}
       testID={`sidebar-workspace-row-${workspace.workspaceKey}`}
     >
-      <Text style={styles.workspaceBranchText} numberOfLines={1}>
-        {resolveWorkspaceBranchLabel(workspace)}
-      </Text>
+      <View style={styles.workspaceRowLeft}>
+        <WorkspaceStatusDot bucket={workspace.statusBucket} />
+        <Text style={styles.workspaceBranchText} numberOfLines={1}>
+          {resolveWorkspaceBranchLabel(workspace)}
+        </Text>
+      </View>
       {createdAtLabel ? (
         <Text style={styles.workspaceCreatedAtText} numberOfLines={1}>
           {createdAtLabel}
@@ -273,7 +273,8 @@ export function SidebarAgentList({
 }: SidebarAgentListProps) {
   const isMobile = UnistylesRuntime.breakpoint === 'xs' || UnistylesRuntime.breakpoint === 'sm'
   const showDesktopWebScrollbar = Platform.OS === 'web' && !isMobile
-  const pathname = usePathname()
+  const segments = useSegments()
+  const shouldReplaceWorkspaceNavigation = segments[0] === 'h'
   const [collapsedProjectKeys, setCollapsedProjectKeys] = useState<Set<string>>(new Set())
   const [canonicalResyncNonce, setCanonicalResyncNonce] = useState(0)
 
@@ -419,13 +420,11 @@ export function SidebarAgentList({
       }
 
       const workspaceRoute = buildHostWorkspaceRoute(serverId ?? '', item.workspace.cwd)
-      const shouldReplace = Boolean(parseHostWorkspaceRouteFromPathname(pathname))
-      const navigate = shouldReplace ? router.replace : router.push
+      const navigate = shouldReplaceWorkspaceNavigation ? router.replace : router.push
 
       return (
         <WorkspaceRow
           workspace={item.workspace}
-          compact={isMobile}
           onPress={() => {
             if (!serverId) {
               return
@@ -441,9 +440,9 @@ export function SidebarAgentList({
       collapsedProjectKeys,
       isMobile,
       onWorkspacePress,
-      pathname,
       projectIconByProjectKey,
       serverId,
+      shouldReplaceWorkspaceNavigation,
       toggleProjectCollapsed,
     ]
   )
@@ -603,27 +602,16 @@ const styles = StyleSheet.create((theme) => ({
     color: theme.colors.foregroundMuted,
     fontSize: 9,
   },
-  projectStatusDot: {
-    width: 8,
-    height: 8,
-    borderRadius: theme.borderRadius.full,
-  },
   projectTitle: {
     color: theme.colors.foreground,
     fontSize: theme.fontSize.sm,
     flex: 1,
     minWidth: 0,
   },
-  projectCountText: {
-    color: theme.colors.foregroundMuted,
-    fontSize: theme.fontSize.xs,
-    flexShrink: 0,
-  },
   workspaceRow: {
-    minHeight: 34,
+    minHeight: 36,
     marginBottom: theme.spacing[1],
-    marginLeft: theme.spacing[4],
-    paddingVertical: theme.spacing[1],
+    paddingVertical: theme.spacing[2],
     paddingHorizontal: theme.spacing[2],
     borderRadius: theme.borderRadius.lg,
     flexDirection: 'row',
@@ -631,9 +619,12 @@ const styles = StyleSheet.create((theme) => ({
     justifyContent: 'space-between',
     gap: theme.spacing[2],
   },
-  workspaceRowCompact: {
-    marginLeft: theme.spacing[3],
-    paddingHorizontal: theme.spacing[1],
+  workspaceRowLeft: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: theme.spacing[2],
+    flex: 1,
+    minWidth: 0,
   },
   workspaceRowHovered: {
     backgroundColor: theme.colors.surface1,
@@ -641,9 +632,15 @@ const styles = StyleSheet.create((theme) => ({
   workspaceRowPressed: {
     backgroundColor: theme.colors.surface2,
   },
+  workspaceStatusDot: {
+    width: 8,
+    height: 8,
+    borderRadius: theme.borderRadius.full,
+    flexShrink: 0,
+  },
   workspaceBranchText: {
     color: theme.colors.foreground,
-    fontSize: theme.fontSize.xs,
+    fontSize: theme.fontSize.sm,
     flex: 1,
     minWidth: 0,
   },

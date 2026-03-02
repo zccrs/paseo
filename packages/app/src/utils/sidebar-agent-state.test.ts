@@ -34,4 +34,15 @@ describe("deriveSidebarStateBucket", () => {
       })
     ).toBe("attention");
   });
+
+  it("treats initializing agents as running", () => {
+    expect(
+      deriveSidebarStateBucket({
+        status: "initializing",
+        pendingPermissionCount: 0,
+        requiresAttention: false,
+        attentionReason: null,
+      })
+    ).toBe("running");
+  });
 });
