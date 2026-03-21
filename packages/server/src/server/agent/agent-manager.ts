@@ -931,6 +931,31 @@ export class AgentManager {
     }
   }
 
+  classifyRecordedUserMessage(
+    agentId: string,
+    text: string,
+    options?: { messageId?: string },
+  ): "new" | "duplicate" | "conflict" {
+    const normalizedMessageId = normalizeMessageId(options?.messageId);
+    if (!normalizedMessageId) {
+      return "new";
+    }
+
+    const agent = this.requireAgent(agentId);
+    for (const row of agent.timelineRows) {
+      if (row.item.type !== "user_message") {
+        continue;
+      }
+      const rowMessageId = normalizeMessageId(row.item.messageId);
+      if (rowMessageId !== normalizedMessageId) {
+        continue;
+      }
+      return row.item.text === text ? "duplicate" : "conflict";
+    }
+
+    return "new";
+  }
+
   async appendTimelineItem(agentId: string, item: AgentTimelineItem): Promise<void> {
     const agent = this.requireAgent(agentId);
     this.touchUpdatedAt(agent);

@@ -2034,7 +2034,28 @@ export async function codexAppServerTurnInputFromPrompt(
 
 export const __codexAppServerInternals = {
   mapCodexPatchNotificationToToolCall,
+  shouldBufferCodexEventUntilTurnStarted,
 };
+
+function isTerminalAgentStreamEvent(event: AgentStreamEvent): boolean {
+  return (
+    event.type === "turn_completed" ||
+    event.type === "turn_failed" ||
+    event.type === "turn_canceled"
+  );
+}
+
+function shouldBufferCodexEventUntilTurnStarted(event: AgentStreamEvent): boolean {
+  if (
+    event.type === "permission_requested" ||
+    event.type === "permission_resolved" ||
+    event.type === "turn_started" ||
+    isTerminalAgentStreamEvent(event)
+  ) {
+    return false;
+  }
+  return true;
+}
 
 class CodexAppServerAgentSession implements AgentSession {
   readonly provider = CODEX_PROVIDER;
@@ -2504,25 +2525,19 @@ class CodexAppServerAgentSession implements AgentSession {
       let sawTurnStarted = false;
       for await (const event of queue) {
         // Drop pre-start timeline noise that can leak from the previous turn.
-        // Keep permission events, which can legitimately arrive before turn_started.
+        // Keep permission and terminal events, which can legitimately arrive
+        // before turn_started on resumed/replayed requests.
         if (!sawTurnStarted) {
-          if (event.type === "permission_requested" || event.type === "permission_resolved") {
-            yield event;
+          if (shouldBufferCodexEventUntilTurnStarted(event)) {
             continue;
           }
           if (event.type === "turn_started") {
             sawTurnStarted = true;
-          } else {
-            continue;
           }
         }
 
         yield event;
-        if (
-          event.type === "turn_completed" ||
-          event.type === "turn_failed" ||
-          event.type === "turn_canceled"
-        ) {
+        if (isTerminalAgentStreamEvent(event)) {
           break;
         }
       }
