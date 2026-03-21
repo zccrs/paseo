@@ -1,28 +1,8 @@
-import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 
 import { createTestLogger } from "../../../test-utils/test-logger.js";
 import { ClaudeAgentClient } from "./claude-agent.js";
-import type {
-  AgentPersistenceHandle,
-  AgentStreamEvent,
-} from "../agent-sdk-types.js";
-
-type Deferred<T> = {
-  promise: Promise<T>;
-  resolve: (value: T) => void;
-  reject: (error: unknown) => void;
-};
-
-const sdkMocks = vi.hoisted(() => ({
-  query: vi.fn(),
-  firstQuery: null as QueryMock | null,
-  secondQuery: null as QueryMock | null,
-  releaseOldAssistant: null as (() => void) | null,
-}));
-
-vi.mock("@anthropic-ai/claude-agent-sdk", () => ({
-  query: sdkMocks.query,
-}));
+import type { AgentStreamEvent } from "../agent-sdk-types.js";
 
 type QueryMock = {
   next: ReturnType<typeof vi.fn>;
@@ -33,16 +13,77 @@ type QueryMock = {
   supportedModels: ReturnType<typeof vi.fn>;
   supportedCommands: ReturnType<typeof vi.fn>;
   rewindFiles: ReturnType<typeof vi.fn>;
+  [Symbol.asyncIterator]: () => AsyncIterator<Record<string, unknown>, void>;
 };
 
-function deferred<T>(): Deferred<T> {
-  let resolve!: (value: T) => void;
-  let reject!: (error: unknown) => void;
-  const promise = new Promise<T>((res, rej) => {
-    resolve = res;
-    reject = rej;
-  });
-  return { promise, resolve, reject };
+type PromptRecord = {
+  text: string;
+  uuid: string | null;
+};
+
+type AsyncQueue<T> = {
+  push: (value: T) => void;
+  next: () => Promise<IteratorResult<T, void>>;
+  end: () => void;
+};
+
+type ScriptedQuery = QueryMock & {
+  emit: (message: Record<string, unknown>) => void;
+  end: () => void;
+  prompts: PromptRecord[];
+};
+
+type PromptHandler = (input: {
+  prompt: Record<string, unknown>;
+  promptRecord: PromptRecord;
+  query: ScriptedQuery;
+}) => void | Promise<void>;
+
+const sdkMocks = vi.hoisted(() => ({
+  query: vi.fn(),
+}));
+
+vi.mock("@anthropic-ai/claude-agent-sdk", () => ({
+  query: sdkMocks.query,
+}));
+
+function createAsyncQueue<T>(): AsyncQueue<T> {
+  const items: T[] = [];
+  const resolvers: Array<(value: IteratorResult<T, void>) => void> = [];
+  let ended = false;
+
+  return {
+    push(value) {
+      if (ended) {
+        return;
+      }
+      const resolve = resolvers.shift();
+      if (resolve) {
+        resolve({ value, done: false });
+        return;
+      }
+      items.push(value);
+    },
+    async next() {
+      const value = items.shift();
+      if (value !== undefined) {
+        return { value, done: false };
+      }
+      if (ended) {
+        return { value: undefined, done: true };
+      }
+      return await new Promise<IteratorResult<T, void>>((resolve) => {
+        resolvers.push(resolve);
+      });
+    },
+    end() {
+      ended = true;
+      while (resolvers.length > 0) {
+        const resolve = resolvers.shift();
+        resolve?.({ value: undefined, done: true });
+      }
+    },
+  };
 }
 
 function buildUsage() {
@@ -53,148 +94,91 @@ function buildUsage() {
   };
 }
 
-function createPromptUuidReader(prompt: AsyncIterable<unknown>) {
-  const iterator = prompt[Symbol.asyncIterator]();
-  let cached: Promise<string | null> | null = null;
-  return async () => {
-    if (!cached) {
-      cached = iterator.next().then((next) => {
-        if (next.done) {
-          return null;
-        }
-        const value = next.value as { uuid?: unknown } | undefined;
-        return typeof value?.uuid === "string" ? value.uuid : null;
+function buildSuccessResult(sessionId: string) {
+  return {
+    type: "result",
+    subtype: "success",
+    usage: buildUsage(),
+    total_cost_usd: 0,
+    session_id: sessionId,
+  };
+}
+
+function extractPromptText(message: Record<string, unknown>): string {
+  const content = (message.message as { content?: unknown } | undefined)?.content;
+  if (typeof content === "string") {
+    return content;
+  }
+  if (!Array.isArray(content)) {
+    return "";
+  }
+  return content
+    .flatMap((block) => {
+      if (!block || typeof block !== "object") {
+        return [];
+      }
+      const text = (block as { text?: unknown }).text;
+      return typeof text === "string" ? [text] : [];
+    })
+    .join("");
+}
+
+function createScriptedQuery(params: {
+  prompt: AsyncIterable<unknown>;
+  sessionId: string;
+  handlePrompt?: PromptHandler;
+}): ScriptedQuery {
+  const output = createAsyncQueue<Record<string, unknown>>();
+  const prompts: PromptRecord[] = [];
+
+  const scriptedQuery = {
+    next: vi.fn(() => output.next()),
+    interrupt: vi.fn(async () => undefined),
+    return: vi.fn(async () => {
+      output.end();
+    }),
+    setPermissionMode: vi.fn(async () => undefined),
+    setModel: vi.fn(async () => undefined),
+    supportedModels: vi.fn(async () => [{ value: "opus", displayName: "Opus" }]),
+    supportedCommands: vi.fn(async () => []),
+    rewindFiles: vi.fn(async () => ({ canRewind: true })),
+    emit: (message: Record<string, unknown>) => {
+      output.push(message);
+    },
+    end: () => {
+      output.end();
+    },
+    prompts,
+    [Symbol.asyncIterator]() {
+      return this;
+    },
+  } satisfies ScriptedQuery;
+
+  scriptedQuery.emit({
+    type: "system",
+    subtype: "init",
+    session_id: params.sessionId,
+    permissionMode: "default",
+    model: "opus",
+  });
+
+  void (async () => {
+    for await (const prompt of params.prompt) {
+      const promptMessage = prompt as Record<string, unknown>;
+      const promptRecord = {
+        text: extractPromptText(promptMessage),
+        uuid: typeof promptMessage.uuid === "string" ? promptMessage.uuid : null,
+      };
+      prompts.push(promptRecord);
+      await params.handlePrompt?.({
+        prompt: promptMessage,
+        promptRecord,
+        query: scriptedQuery,
       });
     }
-    return cached;
-  };
-}
+  })();
 
-function buildFirstQueryMock(
-  allowOldAssistant: Promise<void>
-): QueryMock {
-  let step = 0;
-  return {
-    next: vi.fn(async () => {
-      if (step === 0) {
-        step += 1;
-        return {
-          done: false,
-          value: {
-            type: "system",
-            subtype: "init",
-            session_id: "interrupt-regression-session",
-            permissionMode: "default",
-            model: "opus",
-          },
-        };
-      }
-      if (step === 1) {
-        await allowOldAssistant;
-        step += 1;
-        return {
-          done: false,
-          value: {
-            type: "assistant",
-            message: {
-              content: "OLD_TURN_RESPONSE",
-            },
-          },
-        };
-      }
-      if (step === 2) {
-        step += 1;
-        return {
-          done: false,
-          value: {
-            type: "result",
-            subtype: "success",
-            usage: buildUsage(),
-            total_cost_usd: 0,
-          },
-        };
-      }
-      return { done: true, value: undefined };
-    }),
-    interrupt: vi.fn(async () => {
-      throw new Error("simulated interrupt failure");
-    }),
-    return: vi.fn(async () => undefined),
-    setPermissionMode: vi.fn(async () => undefined),
-    setModel: vi.fn(async () => undefined),
-    supportedModels: vi.fn(async () => [{ value: "opus", displayName: "Opus" }]),
-    supportedCommands: vi.fn(async () => []),
-    rewindFiles: vi.fn(async () => ({ canRewind: true })),
-  };
-}
-
-function buildSecondQueryMock(prompt: AsyncIterable<unknown>): QueryMock {
-  const readPromptUuid = createPromptUuidReader(prompt);
-  let step = 0;
-  return {
-    next: vi.fn(async () => {
-      if (step === 0) {
-        step += 1;
-        return {
-          done: false,
-          value: {
-            type: "system",
-            subtype: "init",
-            session_id: "interrupt-regression-session",
-            permissionMode: "default",
-            model: "opus",
-          },
-        };
-      }
-      if (step === 1) {
-        step += 1;
-        const promptUuid = (await readPromptUuid()) ?? "missing-prompt-uuid";
-        return {
-          done: false,
-          value: {
-            type: "user",
-            message: { role: "user", content: "second prompt" },
-            parent_tool_use_id: null,
-            uuid: promptUuid,
-            session_id: "interrupt-regression-session",
-            isReplay: true,
-          },
-        };
-      }
-      if (step === 2) {
-        step += 1;
-        return {
-          done: false,
-          value: {
-            type: "assistant",
-            message: {
-              content: "NEW_TURN_RESPONSE",
-            },
-          },
-        };
-      }
-      if (step === 3) {
-        step += 1;
-        return {
-          done: false,
-          value: {
-            type: "result",
-            subtype: "success",
-            usage: buildUsage(),
-            total_cost_usd: 0,
-          },
-        };
-      }
-      return { done: true, value: undefined };
-    }),
-    interrupt: vi.fn(async () => undefined),
-    return: vi.fn(async () => undefined),
-    setPermissionMode: vi.fn(async () => undefined),
-    setModel: vi.fn(async () => undefined),
-    supportedModels: vi.fn(async () => [{ value: "opus", displayName: "Opus" }]),
-    supportedCommands: vi.fn(async () => []),
-    rewindFiles: vi.fn(async () => ({ canRewind: true })),
-  };
+  return scriptedQuery;
 }
 
 async function collectUntilTerminal(
@@ -216,81 +200,48 @@ async function collectUntilTerminal(
 
 function collectAssistantText(events: AgentStreamEvent[]): string {
   return events
-    .filter(
-      (event): event is Extract<AgentStreamEvent, { type: "timeline" }> =>
-        event.type === "timeline" && event.item.type === "assistant_message"
-    )
-    .map((event) => event.item.text)
+    .flatMap((event) => {
+      if (event.type !== "timeline" || event.item.type !== "assistant_message") {
+        return [];
+      }
+      return [event.item.text];
+    })
     .join("");
 }
 
-function collectUserText(events: AgentStreamEvent[]): string {
-  return events
-    .filter(
-      (event): event is Extract<AgentStreamEvent, { type: "timeline" }> =>
-        event.type === "timeline" && event.item.type === "user_message"
-    )
-    .map((event) => event.item.text)
-    .join("");
+async function waitFor(
+  predicate: () => boolean,
+  options?: { timeoutMs?: number; intervalMs?: number }
+): Promise<void> {
+  const timeoutMs = options?.timeoutMs ?? 2_000;
+  const intervalMs = options?.intervalMs ?? 5;
+  const startedAt = Date.now();
+  while (!predicate()) {
+    if (Date.now() - startedAt > timeoutMs) {
+      throw new Error("Timed out waiting for condition");
+    }
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
 }
 
-function createTimedIteratorReader<T>(params: { iterator: AsyncIterator<T> }) {
-  const { iterator } = params;
-  let pendingNext: Promise<IteratorResult<T>> | null = null;
+afterEach(() => {
+  sdkMocks.query.mockReset();
+});
 
-  return {
-    async nextWithTimeout(timeoutMs: number): Promise<IteratorResult<T>> {
-      if (!pendingNext) {
-        pendingNext = iterator.next();
-      }
-      const timeout = new Promise<null>((resolve) => {
-        setTimeout(() => resolve(null), timeoutMs);
-      });
-      const outcome = await Promise.race([
-        pendingNext.then((result) => ({ kind: "result" as const, result })),
-        timeout.then(() => ({ kind: "timeout" as const })),
-      ]);
-      if (outcome.kind === "timeout") {
-        throw new Error("Timed out waiting for live event");
-      }
-      pendingNext = null;
-      return outcome.result;
-    },
-  };
-}
-
-describe("ClaudeAgentSession interrupt restart regression", () => {
-  beforeEach(() => {
-    const allowOldAssistant = deferred<void>();
-    let queryCreateCount = 0;
-
-    sdkMocks.query.mockImplementation(
-      ({ prompt }: { prompt: AsyncIterable<unknown> }) => {
-        queryCreateCount += 1;
-        if (queryCreateCount === 1) {
-          const mock = buildFirstQueryMock(allowOldAssistant.promise);
-          sdkMocks.firstQuery = mock;
-          return mock;
-        }
-        const mock = buildSecondQueryMock(prompt);
-        if (queryCreateCount === 2) {
-          sdkMocks.secondQuery = mock;
-        }
-        return mock;
-      }
-    );
-    sdkMocks.releaseOldAssistant = () => allowOldAssistant.resolve();
-  });
-
-  afterEach(() => {
-    sdkMocks.query.mockReset();
-    sdkMocks.firstQuery = null;
-    sdkMocks.secondQuery = null;
-    sdkMocks.releaseOldAssistant = null;
-  });
-
-  test("starts a fresh query after interrupt failure to avoid stale old-turn response", async () => {
+describe("ClaudeAgentSession interrupt regression", () => {
+  test("interrupt only calls query.interrupt and leaves the query open", async () => {
     const logger = createTestLogger();
+    const queries: ScriptedQuery[] = [];
+
+    sdkMocks.query.mockImplementation(({ prompt }: { prompt: AsyncIterable<unknown> }) => {
+      const scriptedQuery = createScriptedQuery({
+        prompt,
+        sessionId: "interrupt-keep-query-session",
+      });
+      queries.push(scriptedQuery);
+      return scriptedQuery;
+    });
+
     const client = new ClaudeAgentClient({ logger });
     const session = await client.createSession({
       provider: "claude",
@@ -299,249 +250,144 @@ describe("ClaudeAgentSession interrupt restart regression", () => {
 
     const firstTurn = session.stream("first prompt");
     await firstTurn.next();
+    await waitFor(() => queries[0]?.prompts.length === 1);
 
-    const secondTurnPromise = collectUntilTerminal(session.stream("second prompt"));
-    for (let attempt = 0; attempt < 40; attempt += 1) {
-      if (sdkMocks.secondQuery) {
-        break;
-      }
-      await new Promise((resolve) => setTimeout(resolve, 5));
-    }
-    sdkMocks.releaseOldAssistant?.();
+    await session.interrupt();
+    await waitFor(() => queries[0]?.interrupt.mock.calls.length === 1);
 
-    const secondTurnEvents = await secondTurnPromise;
-    const secondAssistantText = collectAssistantText(secondTurnEvents);
+    expect(sdkMocks.query).toHaveBeenCalledTimes(1);
+    expect(queries[0]?.return).not.toHaveBeenCalled();
 
-    expect(sdkMocks.firstQuery).toBeTruthy();
-    expect(sdkMocks.secondQuery).toBeTruthy();
-    expect(sdkMocks.firstQuery).not.toBe(sdkMocks.secondQuery);
-    expect(sdkMocks.firstQuery?.interrupt).toHaveBeenCalledTimes(1);
-    expect(sdkMocks.secondQuery?.next).toHaveBeenCalled();
-    expect(secondAssistantText).toContain("NEW_TURN_RESPONSE");
-    expect(secondAssistantText).not.toContain("OLD_TURN_RESPONSE");
+    const firstTurnEvents = await collectUntilTerminal(firstTurn);
+    expect(
+      firstTurnEvents.find((event) => event.type === "turn_canceled")
+    ).toMatchObject({
+      type: "turn_canceled",
+      provider: "claude",
+      reason: "Interrupted",
+    });
+
+    await session.close();
+  });
+
+  test("pushes the next prompt into the existing query instead of rebuilding it", async () => {
+    const logger = createTestLogger();
+    const queries: ScriptedQuery[] = [];
+
+    sdkMocks.query.mockImplementation(({ prompt }: { prompt: AsyncIterable<unknown> }) => {
+      const scriptedQuery = createScriptedQuery({
+        prompt,
+        sessionId: "interrupt-reuse-query-session",
+        async handlePrompt({ promptRecord, query }) {
+          if (promptRecord.text !== "second prompt") {
+            return;
+          }
+          query.emit({
+            type: "assistant",
+            message: { content: "SECOND_PROMPT_RESPONSE" },
+            session_id: "interrupt-reuse-query-session",
+          });
+          query.emit(buildSuccessResult("interrupt-reuse-query-session"));
+        },
+      });
+      queries.push(scriptedQuery);
+      return scriptedQuery;
+    });
+
+    const client = new ClaudeAgentClient({ logger });
+    const session = await client.createSession({
+      provider: "claude",
+      cwd: process.cwd(),
+    });
+
+    const firstTurn = session.stream("first prompt");
+    await firstTurn.next();
+    await waitFor(() => queries[0]?.prompts.length === 1);
+
+    const secondTurnEvents = await collectUntilTerminal(session.stream("second prompt"));
+
+    expect(sdkMocks.query).toHaveBeenCalledTimes(1);
+    expect(queries[0]?.prompts.map((prompt) => prompt.text)).toEqual([
+      "first prompt",
+      "second prompt",
+    ]);
+    expect(queries[0]?.interrupt).toHaveBeenCalledTimes(1);
+    expect(queries[0]?.return).not.toHaveBeenCalled();
+    expect(collectAssistantText(secondTurnEvents)).toContain("SECOND_PROMPT_RESPONSE");
 
     await firstTurn.return?.();
     await session.close();
   });
 
-  test("restarts after interrupt scaffold query drain without surfacing placeholder transcript noise", async () => {
+  test("recovers when the query pump sees a single interrupt abort before the next prompt", async () => {
     const logger = createTestLogger();
-    let queryCreateCount = 0;
+    const output = createAsyncQueue<Record<string, unknown>>();
+    const prompts: PromptRecord[] = [];
+    let throwAbortOnNext = false;
 
     sdkMocks.query.mockImplementation(({ prompt }: { prompt: AsyncIterable<unknown> }) => {
-      queryCreateCount += 1;
-
-      if (queryCreateCount === 1) {
-        let step = 0;
-        return {
-          next: vi.fn(async () => {
-            if (step === 0) {
-              step += 1;
-              return {
-                done: false,
-                value: {
-                  type: "system",
-                  subtype: "init",
-                  session_id: "interrupt-scaffold-session",
-                  permissionMode: "default",
-                  model: "opus",
-                },
-              };
-            }
-            if (step === 1) {
-              step += 1;
-              return {
-                done: false,
-                value: {
-                  type: "user",
-                  message: {
-                    role: "user",
-                    content: [{ type: "text", text: "[Request interrupted by user]" }],
-                  },
-                  parent_tool_use_id: null,
-                  uuid: "interrupt-scaffold-1",
-                  session_id: "interrupt-scaffold-session",
-                },
-              };
-            }
-            if (step === 2) {
-              step += 1;
-              return {
-                done: false,
-                value: {
-                  type: "assistant",
-                  message: {
-                    content: "Got it. Sorry for the mess.",
-                  },
-                },
-              };
-            }
-            if (step === 3) {
-              step += 1;
-              return {
-                done: false,
-                value: {
-                  type: "assistant",
-                  message: {
-                    content: "No response requested.",
-                  },
-                },
-              };
-            }
-            return { done: true, value: undefined };
-          }),
-          interrupt: vi.fn(async () => undefined),
-          return: vi.fn(async () => undefined),
-          setPermissionMode: vi.fn(async () => undefined),
-          setModel: vi.fn(async () => undefined),
-          supportedModels: vi.fn(async () => [{ value: "opus", displayName: "Opus" }]),
-          supportedCommands: vi.fn(async () => []),
-          rewindFiles: vi.fn(async () => ({ canRewind: true })),
-        } satisfies QueryMock;
-      }
-
-      const readPromptUuid = createPromptUuidReader(prompt);
-      let step = 0;
-      return {
+      const scriptedQuery = {
         next: vi.fn(async () => {
-          if (step === 0) {
-            step += 1;
-            return {
-              done: false,
-              value: {
-                type: "system",
-                subtype: "init",
-                session_id: "interrupt-scaffold-session",
-                permissionMode: "default",
-                model: "opus",
-              },
-            };
+          if (throwAbortOnNext) {
+            throwAbortOnNext = false;
+            throw new Error("Request was aborted.");
           }
-          if (step === 1) {
-            step += 1;
-            const promptUuid = (await readPromptUuid()) ?? "missing-prompt-uuid";
-            return {
-              done: false,
-              value: {
-                type: "user",
-                message: { role: "user", content: "fresh prompt" },
-                parent_tool_use_id: null,
-                uuid: promptUuid,
-                session_id: "interrupt-scaffold-session",
-                isReplay: true,
-              },
-            };
-          }
-          if (step === 2) {
-            step += 1;
-            return {
-              done: false,
-              value: {
-                type: "assistant",
-                message: {
-                  content: "FRESH_RESPONSE_AFTER_INTERRUPT",
-                },
-              },
-            };
-          }
-          if (step === 3) {
-            step += 1;
-            return {
-              done: false,
-              value: {
-                type: "result",
-                subtype: "success",
-                usage: buildUsage(),
-                total_cost_usd: 0,
-              },
-            };
-          }
-          return { done: true, value: undefined };
+          return output.next();
         }),
-        interrupt: vi.fn(async () => undefined),
-        return: vi.fn(async () => undefined),
+        interrupt: vi.fn(async () => {
+          throwAbortOnNext = true;
+        }),
+        return: vi.fn(async () => {
+          output.end();
+        }),
         setPermissionMode: vi.fn(async () => undefined),
         setModel: vi.fn(async () => undefined),
         supportedModels: vi.fn(async () => [{ value: "opus", displayName: "Opus" }]),
         supportedCommands: vi.fn(async () => []),
         rewindFiles: vi.fn(async () => ({ canRewind: true })),
-      } satisfies QueryMock;
-    });
+        emit: (message: Record<string, unknown>) => {
+          output.push(message);
+        },
+        end: () => {
+          output.end();
+        },
+        prompts,
+        [Symbol.asyncIterator]() {
+          return this;
+        },
+      } satisfies ScriptedQuery;
 
-    const client = new ClaudeAgentClient({ logger });
-    const session = await client.createSession({
-      provider: "claude",
-      cwd: process.cwd(),
-    });
+      scriptedQuery.emit({
+        type: "system",
+        subtype: "init",
+        session_id: "interrupt-abort-recovery-session",
+        permissionMode: "default",
+        model: "opus",
+      });
 
-    const events = await collectUntilTerminal(session.stream("fresh prompt"));
-    const assistantText = collectAssistantText(events);
-    const userText = collectUserText(events);
-    await session.close();
+      void (async () => {
+        for await (const promptMessage of prompt) {
+          const record = promptMessage as Record<string, unknown>;
+          const promptRecord = {
+            text: extractPromptText(record),
+            uuid: typeof record.uuid === "string" ? record.uuid : null,
+          };
+          prompts.push(promptRecord);
 
-    expect(queryCreateCount).toBeGreaterThanOrEqual(2);
-    expect(assistantText).toContain("FRESH_RESPONSE_AFTER_INTERRUPT");
-    expect(assistantText).not.toContain("Got it. Sorry for the mess.");
-    expect(assistantText).not.toContain("No response requested.");
-    expect(userText).not.toContain("[Request interrupted by user]");
-    expect(
-      events.some(
-        (event) =>
-          event.type === "turn_failed" &&
-          event.error.includes("Claude stream ended before terminal result")
-      )
-    ).toBe(false);
-    expect(events.some((event) => event.type === "turn_completed")).toBe(true);
-  });
+          if (promptRecord.text !== "second prompt") {
+            continue;
+          }
 
-  test("ignores stale interrupted query completion after the replacement run starts", async () => {
-    const logger = createTestLogger();
-    const releaseOldDone = deferred<void>();
-    let queryCreateCount = 0;
+          output.push({
+            type: "assistant",
+            message: { content: "SECOND_PROMPT_RESPONSE" },
+            session_id: "interrupt-abort-recovery-session",
+          });
+          output.push(buildSuccessResult("interrupt-abort-recovery-session"));
+        }
+      })();
 
-    sdkMocks.query.mockImplementation(({ prompt }: { prompt: AsyncIterable<unknown> }) => {
-      queryCreateCount += 1;
-      if (queryCreateCount === 1) {
-        let step = 0;
-        const mock = {
-          next: vi.fn(async () => {
-            if (step === 0) {
-              step += 1;
-              return {
-                done: false,
-                value: {
-                  type: "system",
-                  subtype: "init",
-                  session_id: "interrupt-stale-done-session",
-                  permissionMode: "default",
-                  model: "opus",
-                },
-              };
-            }
-            if (step === 1) {
-              await releaseOldDone.promise;
-              step += 1;
-              return { done: true, value: undefined };
-            }
-            return { done: true, value: undefined };
-          }),
-          interrupt: vi.fn(async () => undefined),
-          return: vi.fn(async () => undefined),
-          setPermissionMode: vi.fn(async () => undefined),
-          setModel: vi.fn(async () => undefined),
-          supportedModels: vi.fn(async () => [{ value: "opus", displayName: "Opus" }]),
-          supportedCommands: vi.fn(async () => []),
-          rewindFiles: vi.fn(async () => ({ canRewind: true })),
-        } satisfies QueryMock;
-        sdkMocks.firstQuery = mock;
-        return mock;
-      }
-
-      const mock = buildSecondQueryMock(prompt);
-      if (queryCreateCount === 2) {
-        sdkMocks.secondQuery = mock;
-      }
-      return mock;
+      return scriptedQuery;
     });
 
     const client = new ClaudeAgentClient({ logger });
@@ -552,1358 +398,43 @@ describe("ClaudeAgentSession interrupt restart regression", () => {
 
     const firstTurn = session.stream("first prompt");
     await firstTurn.next();
+    await session.interrupt();
+    await collectUntilTerminal(firstTurn);
 
-    const secondTurnPromise = collectUntilTerminal(session.stream("second prompt"));
-    for (let attempt = 0; attempt < 40; attempt += 1) {
-      if (sdkMocks.secondQuery) {
-        break;
-      }
-      await new Promise((resolve) => setTimeout(resolve, 5));
-    }
-    releaseOldDone.resolve(undefined);
+    const secondTurnEvents = await collectUntilTerminal(session.stream("second prompt"));
 
-    const secondTurnEvents = await secondTurnPromise;
-    const secondAssistantText = collectAssistantText(secondTurnEvents);
-
-    expect(sdkMocks.firstQuery?.interrupt).toHaveBeenCalledTimes(1);
-    expect(sdkMocks.secondQuery?.next).toHaveBeenCalled();
-    expect(secondAssistantText).toContain("NEW_TURN_RESPONSE");
-    expect(
-      secondTurnEvents.some(
-        (event) =>
-          event.type === "turn_failed" &&
-          event.error.includes("Claude stream ended before terminal result")
-      )
-    ).toBe(false);
+    expect(sdkMocks.query).toHaveBeenCalledTimes(1);
+    expect(prompts.map((prompt) => prompt.text)).toEqual(["first prompt", "second prompt"]);
+    expect(collectAssistantText(secondTurnEvents)).toContain("SECOND_PROMPT_RESPONSE");
     expect(secondTurnEvents.some((event) => event.type === "turn_completed")).toBe(true);
 
-    await firstTurn.return?.();
     await session.close();
   });
+});
 
-  test("ignores stale task-notification assistant/result events queued before the current prompt", async () => {
+describe("ClaudeAgentSession autonomous turns", () => {
+  test("creates an autonomous live turn when assistant output arrives without a foreground run", async () => {
     const logger = createTestLogger();
+    let queryRef: ScriptedQuery | null = null;
 
     sdkMocks.query.mockImplementation(({ prompt }: { prompt: AsyncIterable<unknown> }) => {
-      const readPromptUuid = createPromptUuidReader(prompt);
-      let step = 0;
-      return {
-        next: vi.fn(async () => {
-          if (step === 0) {
-            step += 1;
-            return {
-              done: false,
-              value: {
-                type: "system",
-                subtype: "init",
-                session_id: "task-notification-session",
-                permissionMode: "default",
-                model: "opus",
-              },
-            };
+      queryRef = createScriptedQuery({
+        prompt,
+        sessionId: "autonomous-live-session",
+        async handlePrompt({ promptRecord, query }) {
+          if (promptRecord.text !== "seed prompt") {
+            return;
           }
-          if (step === 1) {
-            step += 1;
-            return {
-              done: false,
-              value: {
-                type: "system",
-                subtype: "task_notification",
-                task_id: "task-123",
-                status: "completed",
-                output_file: "/tmp/task-123.txt",
-                summary: "Codex agent is done",
-                session_id: "task-notification-session",
-                uuid: "task-note-1",
-              },
-            };
-          }
-          if (step === 2) {
-            step += 1;
-            return {
-              done: false,
-              value: {
-                type: "assistant",
-                message: {
-                  content: "STALE_TASK_NOTIFICATION_RESPONSE",
-                },
-              },
-            };
-          }
-          if (step === 3) {
-            step += 1;
-            return {
-              done: false,
-              value: {
-                type: "result",
-                subtype: "success",
-                usage: buildUsage(),
-                total_cost_usd: 0,
-              },
-            };
-          }
-          if (step === 4) {
-            step += 1;
-            const promptUuid = (await readPromptUuid()) ?? "missing-prompt-uuid";
-            return {
-              done: false,
-              value: {
-                type: "user",
-                message: { role: "user", content: "current prompt" },
-                parent_tool_use_id: null,
-                uuid: promptUuid,
-                session_id: "task-notification-session",
-                isReplay: true,
-              },
-            };
-          }
-          if (step === 5) {
-            step += 1;
-            return {
-              done: false,
-              value: {
-                type: "assistant",
-                message: {
-                  content: "CURRENT_PROMPT_RESPONSE",
-                },
-              },
-            };
-          }
-          if (step === 6) {
-            step += 1;
-            return {
-              done: false,
-              value: {
-                type: "result",
-                subtype: "success",
-                usage: buildUsage(),
-                total_cost_usd: 0,
-              },
-            };
-          }
-          return { done: true, value: undefined };
-        }),
-        interrupt: vi.fn(async () => undefined),
-        return: vi.fn(async () => undefined),
-        setPermissionMode: vi.fn(async () => undefined),
-        setModel: vi.fn(async () => undefined),
-        supportedModels: vi.fn(async () => [{ value: "opus", displayName: "Opus" }]),
-        supportedCommands: vi.fn(async () => []),
-        rewindFiles: vi.fn(async () => ({ canRewind: true })),
-      } satisfies QueryMock;
+          query.emit({
+            type: "assistant",
+            message: { content: "SEED_RESPONSE" },
+            session_id: "autonomous-live-session",
+          });
+          query.emit(buildSuccessResult("autonomous-live-session"));
+        },
+      });
+      return queryRef;
     });
-
-    const client = new ClaudeAgentClient({ logger });
-    const session = await client.createSession({
-      provider: "claude",
-      cwd: process.cwd(),
-    });
-
-    const events = await collectUntilTerminal(session.stream("current prompt"));
-    const assistantText = collectAssistantText(events);
-
-    expect(assistantText).toContain("CURRENT_PROMPT_RESPONSE");
-    expect(assistantText).not.toContain("STALE_TASK_NOTIFICATION_RESPONSE");
-
-    await session.close();
-  });
-
-  test("ignores stale task-notification message_start bursts before prompt replay", async () => {
-    const logger = createTestLogger();
-
-    sdkMocks.query.mockImplementation(({ prompt }: { prompt: AsyncIterable<unknown> }) => {
-      const readPromptUuid = createPromptUuidReader(prompt);
-      let step = 0;
-      return {
-        next: vi.fn(async () => {
-          if (step === 0) {
-            step += 1;
-            return {
-              done: false,
-              value: {
-                type: "system",
-                subtype: "init",
-                session_id: "task-notification-message-start-session",
-                permissionMode: "default",
-                model: "opus",
-              },
-            };
-          }
-          if (step === 1) {
-            step += 1;
-            return {
-              done: false,
-              value: {
-                type: "system",
-                subtype: "task_notification",
-                task_id: "task-msg-start-1",
-                status: "completed",
-                output_file: "/tmp/task-msg-start-1.txt",
-                summary: "Background task finished",
-                session_id: "task-notification-message-start-session",
-                uuid: "task-msg-start-note-1",
-              },
-            };
-          }
-          if (step === 2) {
-            step += 1;
-            return {
-              done: false,
-              value: {
-                type: "stream_event",
-                parent_tool_use_id: null,
-                event: {
-                  type: "message_start",
-                  message: {
-                    id: "stale-msg-start-1",
-                    role: "assistant",
-                    model: "opus",
-                    usage: { input_tokens: 1, output_tokens: 0 },
-                  },
-                },
-              },
-            };
-          }
-          if (step === 3) {
-            step += 1;
-            return {
-              done: false,
-              value: {
-                type: "assistant",
-                message: {
-                  content: "STALE_MESSAGE_START_RESPONSE",
-                },
-              },
-            };
-          }
-          if (step === 4) {
-            step += 1;
-            return {
-              done: false,
-              value: {
-                type: "result",
-                subtype: "success",
-                usage: buildUsage(),
-                total_cost_usd: 0,
-              },
-            };
-          }
-          if (step === 5) {
-            step += 1;
-            const promptUuid = (await readPromptUuid()) ?? "missing-prompt-uuid";
-            return {
-              done: false,
-              value: {
-                type: "user",
-                message: { role: "user", content: "current prompt" },
-                parent_tool_use_id: null,
-                uuid: promptUuid,
-                session_id: "task-notification-message-start-session",
-                isReplay: true,
-              },
-            };
-          }
-          if (step === 6) {
-            step += 1;
-            return {
-              done: false,
-              value: {
-                type: "assistant",
-                message: {
-                  content: "CURRENT_AFTER_MESSAGE_START",
-                },
-              },
-            };
-          }
-          if (step === 7) {
-            step += 1;
-            return {
-              done: false,
-              value: {
-                type: "result",
-                subtype: "success",
-                usage: buildUsage(),
-                total_cost_usd: 0,
-              },
-            };
-          }
-          return { done: true, value: undefined };
-        }),
-        interrupt: vi.fn(async () => undefined),
-        return: vi.fn(async () => undefined),
-        setPermissionMode: vi.fn(async () => undefined),
-        setModel: vi.fn(async () => undefined),
-        supportedModels: vi.fn(async () => [{ value: "opus", displayName: "Opus" }]),
-        supportedCommands: vi.fn(async () => []),
-        rewindFiles: vi.fn(async () => ({ canRewind: true })),
-      } satisfies QueryMock;
-    });
-
-    const client = new ClaudeAgentClient({ logger });
-    const session = await client.createSession({
-      provider: "claude",
-      cwd: process.cwd(),
-    });
-
-    const events = await collectUntilTerminal(session.stream("current prompt"));
-    const assistantText = collectAssistantText(events);
-
-    expect(assistantText).toContain("CURRENT_AFTER_MESSAGE_START");
-    expect(assistantText).not.toContain("STALE_MESSAGE_START_RESPONSE");
-
-    await session.close();
-  });
-
-  test("ignores stale user-shaped task-notification message_start bursts before prompt replay", async () => {
-    const logger = createTestLogger();
-
-    sdkMocks.query.mockImplementation(({ prompt }: { prompt: AsyncIterable<unknown> }) => {
-      const readPromptUuid = createPromptUuidReader(prompt);
-      let step = 0;
-      return {
-        next: vi.fn(async () => {
-          if (step === 0) {
-            step += 1;
-            return {
-              done: false,
-              value: {
-                type: "system",
-                subtype: "init",
-                session_id: "task-notification-user-message-start-session",
-                permissionMode: "default",
-                model: "opus",
-              },
-            };
-          }
-          if (step === 1) {
-            step += 1;
-            return {
-              done: false,
-              value: {
-                type: "user",
-                message: {
-                  role: "user",
-                  content:
-                    "<task-notification>\n<task-id>task-msg-start-user-1</task-id>\n</task-notification>",
-                },
-                parent_tool_use_id: null,
-                uuid: "task-msg-start-user-1",
-                session_id: "task-notification-user-message-start-session",
-              },
-            };
-          }
-          if (step === 2) {
-            step += 1;
-            return {
-              done: false,
-              value: {
-                type: "stream_event",
-                parent_tool_use_id: null,
-                event: {
-                  type: "message_start",
-                  message: {
-                    id: "stale-user-msg-start-1",
-                    role: "assistant",
-                    model: "opus",
-                    usage: { input_tokens: 1, output_tokens: 0 },
-                  },
-                },
-              },
-            };
-          }
-          if (step === 3) {
-            step += 1;
-            return {
-              done: false,
-              value: {
-                type: "assistant",
-                message: {
-                  content: "STALE_USER_TASK_NOTIFICATION_RESPONSE",
-                },
-              },
-            };
-          }
-          if (step === 4) {
-            step += 1;
-            return {
-              done: false,
-              value: {
-                type: "result",
-                subtype: "success",
-                usage: buildUsage(),
-                total_cost_usd: 0,
-              },
-            };
-          }
-          if (step === 5) {
-            step += 1;
-            const promptUuid = (await readPromptUuid()) ?? "missing-prompt-uuid";
-            return {
-              done: false,
-              value: {
-                type: "user",
-                message: { role: "user", content: "current prompt" },
-                parent_tool_use_id: null,
-                uuid: promptUuid,
-                session_id: "task-notification-user-message-start-session",
-                isReplay: true,
-              },
-            };
-          }
-          if (step === 6) {
-            step += 1;
-            return {
-              done: false,
-              value: {
-                type: "assistant",
-                message: {
-                  content: "CURRENT_AFTER_USER_MESSAGE_START",
-                },
-              },
-            };
-          }
-          if (step === 7) {
-            step += 1;
-            return {
-              done: false,
-              value: {
-                type: "result",
-                subtype: "success",
-                usage: buildUsage(),
-                total_cost_usd: 0,
-              },
-            };
-          }
-          return { done: true, value: undefined };
-        }),
-        interrupt: vi.fn(async () => undefined),
-        return: vi.fn(async () => undefined),
-        setPermissionMode: vi.fn(async () => undefined),
-        setModel: vi.fn(async () => undefined),
-        supportedModels: vi.fn(async () => [{ value: "opus", displayName: "Opus" }]),
-        supportedCommands: vi.fn(async () => []),
-        rewindFiles: vi.fn(async () => ({ canRewind: true })),
-      } satisfies QueryMock;
-    });
-
-    const client = new ClaudeAgentClient({ logger });
-    const session = await client.createSession({
-      provider: "claude",
-      cwd: process.cwd(),
-    });
-
-    const events = await collectUntilTerminal(session.stream("current prompt"));
-    const assistantText = collectAssistantText(events);
-
-    expect(assistantText).toContain("CURRENT_AFTER_USER_MESSAGE_START");
-    expect(assistantText).not.toContain("STALE_USER_TASK_NOTIFICATION_RESPONSE");
-
-    await session.close();
-  });
-
-  test("does not terminate the current prompt on a stale pre-prompt result event", async () => {
-    const logger = createTestLogger();
-
-    sdkMocks.query.mockImplementation(({ prompt }: { prompt: AsyncIterable<unknown> }) => {
-      const readPromptUuid = createPromptUuidReader(prompt);
-      let step = 0;
-      return {
-        next: vi.fn(async () => {
-          if (step === 0) {
-            step += 1;
-            return {
-              done: false,
-              value: {
-                type: "system",
-                subtype: "init",
-                session_id: "stale-result-session",
-                permissionMode: "default",
-                model: "opus",
-              },
-            };
-          }
-          if (step === 1) {
-            step += 1;
-            return {
-              done: false,
-              value: {
-                type: "result",
-                subtype: "success",
-                usage: buildUsage(),
-                total_cost_usd: 0,
-              },
-            };
-          }
-          if (step === 2) {
-            step += 1;
-            const promptUuid = (await readPromptUuid()) ?? "missing-prompt-uuid";
-            return {
-              done: false,
-              value: {
-                type: "user",
-                message: { role: "user", content: "current prompt" },
-                parent_tool_use_id: null,
-                uuid: promptUuid,
-                session_id: "stale-result-session",
-                isReplay: true,
-              },
-            };
-          }
-          if (step === 3) {
-            step += 1;
-            return {
-              done: false,
-              value: {
-                type: "assistant",
-                message: {
-                  content: "FRESH_AFTER_STALE_RESULT",
-                },
-              },
-            };
-          }
-          if (step === 4) {
-            step += 1;
-            return {
-              done: false,
-              value: {
-                type: "result",
-                subtype: "success",
-                usage: buildUsage(),
-                total_cost_usd: 0,
-              },
-            };
-          }
-          return { done: true, value: undefined };
-        }),
-        interrupt: vi.fn(async () => undefined),
-        return: vi.fn(async () => undefined),
-        setPermissionMode: vi.fn(async () => undefined),
-        setModel: vi.fn(async () => undefined),
-        supportedModels: vi.fn(async () => [{ value: "opus", displayName: "Opus" }]),
-        supportedCommands: vi.fn(async () => []),
-        rewindFiles: vi.fn(async () => ({ canRewind: true })),
-      } satisfies QueryMock;
-    });
-
-    const client = new ClaudeAgentClient({ logger });
-    const session = await client.createSession({
-      provider: "claude",
-      cwd: process.cwd(),
-    });
-
-    const events = await collectUntilTerminal(session.stream("current prompt"));
-    const assistantText = collectAssistantText(events);
-
-    expect(assistantText).toContain("FRESH_AFTER_STALE_RESULT");
-
-    await session.close();
-  });
-
-  test("does not create an orphan autonomous run from pre-replay task_started metadata", async () => {
-    const logger = createTestLogger();
-    const keepQueryAlive = deferred<void>();
-
-    sdkMocks.query.mockImplementation(({ prompt }: { prompt: AsyncIterable<unknown> }) => {
-      const readPromptUuid = createPromptUuidReader(prompt);
-      let step = 0;
-      return {
-        next: vi.fn(async () => {
-          if (step === 0) {
-            step += 1;
-            return {
-              done: false,
-              value: {
-                type: "system",
-                subtype: "init",
-                session_id: "task-started-fallback-session",
-                permissionMode: "default",
-                model: "opus",
-              },
-            };
-          }
-          if (step === 1) {
-            step += 1;
-            return {
-              done: false,
-              value: {
-                type: "assistant",
-                message: {
-                  id: "tool-call-msg",
-                  content: [
-                    {
-                      type: "tool_use",
-                      id: "toolu_1",
-                      name: "Agent",
-                      input: { description: "verify", prompt: "sub-task" },
-                    },
-                  ],
-                },
-              },
-            };
-          }
-          if (step === 2) {
-            step += 1;
-            return {
-              done: false,
-              value: {
-                type: "system",
-                subtype: "task_started",
-                task_id: "task-1",
-                tool_use_id: "toolu_1",
-                description: "verify",
-                task_type: "local_agent",
-                session_id: "task-started-fallback-session",
-                uuid: "task-started-1",
-              },
-            };
-          }
-          if (step === 3) {
-            step += 1;
-            return {
-              done: false,
-              value: {
-                type: "stream_event",
-                event: {
-                  type: "message_delta",
-                  delta: { stop_reason: "tool_use", stop_sequence: null },
-                  usage: buildUsage(),
-                },
-                session_id: "task-started-fallback-session",
-                parent_tool_use_id: null,
-                uuid: "msg-delta-tool-use",
-              },
-            };
-          }
-          if (step === 4) {
-            step += 1;
-            const promptUuid = (await readPromptUuid()) ?? "missing-prompt-uuid";
-            return {
-              done: false,
-              value: {
-                type: "user",
-                message: { role: "user", content: "current prompt" },
-                parent_tool_use_id: null,
-                uuid: promptUuid,
-                session_id: "task-started-fallback-session",
-                isReplay: true,
-              },
-            };
-          }
-          if (step === 5) {
-            step += 1;
-            return {
-              done: false,
-              value: {
-                type: "assistant",
-                message: {
-                  content: "FOREGROUND_DONE",
-                },
-              },
-            };
-          }
-          if (step === 6) {
-            step += 1;
-            return {
-              done: false,
-              value: {
-                type: "result",
-                subtype: "success",
-                usage: buildUsage(),
-                total_cost_usd: 0,
-              },
-            };
-          }
-          if (step === 7) {
-            await keepQueryAlive.promise;
-            return { done: true, value: undefined };
-          }
-          return { done: true, value: undefined };
-        }),
-        interrupt: vi.fn(async () => undefined),
-        return: vi.fn(async () => undefined),
-        setPermissionMode: vi.fn(async () => undefined),
-        setModel: vi.fn(async () => undefined),
-        supportedModels: vi.fn(async () => [{ value: "opus", displayName: "Opus" }]),
-        supportedCommands: vi.fn(async () => []),
-        rewindFiles: vi.fn(async () => ({ canRewind: true })),
-      } satisfies QueryMock;
-    });
-
-    const client = new ClaudeAgentClient({ logger });
-    const session = await client.createSession({
-      provider: "claude",
-      cwd: process.cwd(),
-    });
-
-    const events = await collectUntilTerminal(session.stream("current prompt"));
-    const assistantText = collectAssistantText(events);
-
-    expect(assistantText).toContain("FOREGROUND_DONE");
-    expect(
-      (session as unknown as { turnState?: string }).turnState ?? null
-    ).toBe("idle");
-    expect(
-      (
-        session as unknown as {
-          runTracker?: { listActiveRuns: (owner?: "foreground" | "autonomous") => unknown[] };
-        }
-      ).runTracker?.listActiveRuns("autonomous") ?? []
-    ).toHaveLength(0);
-
-    keepQueryAlive.resolve(undefined);
-    await session.close();
-  });
-
-  test("ignores unmatched resumed-session errors without starting an autonomous run", async () => {
-    const logger = createTestLogger();
-    const keepQueryAlive = deferred<void>();
-
-    sdkMocks.query.mockImplementation(() => {
-      let step = 0;
-      return {
-        next: vi.fn(async () => {
-          if (step === 0) {
-            step += 1;
-            return {
-              done: false,
-              value: {
-                type: "result",
-                subtype: "error_during_execution",
-                session_id: "new-session-after-missing-conversation",
-                errors: [
-                  "No conversation found with session ID: persisted-stale-session",
-                ],
-                num_turns: 0,
-                duration_ms: 0,
-                duration_api_ms: 0,
-                is_error: true,
-                stop_reason: null,
-                total_cost_usd: 0,
-                usage: buildUsage(),
-              },
-            };
-          }
-          await keepQueryAlive.promise;
-          return { done: true, value: undefined };
-        }),
-        interrupt: vi.fn(async () => undefined),
-        return: vi.fn(async () => undefined),
-        setPermissionMode: vi.fn(async () => undefined),
-        setModel: vi.fn(async () => undefined),
-        supportedModels: vi.fn(async () => [{ value: "opus", displayName: "Opus" }]),
-        supportedCommands: vi.fn(async () => []),
-        rewindFiles: vi.fn(async () => ({ canRewind: true })),
-      } satisfies QueryMock;
-    });
-
-    const client = new ClaudeAgentClient({ logger });
-    const handle: AgentPersistenceHandle = {
-      provider: "claude",
-      sessionId: "persisted-stale-session",
-      nativeHandle: "persisted-stale-session",
-      metadata: {
-        provider: "claude",
-        cwd: process.cwd(),
-      },
-    };
-
-    const session = await client.resumeSession(handle, { cwd: process.cwd() });
-    await new Promise((resolve) => setTimeout(resolve, 25));
-
-    const activeRuns = (
-      session as unknown as {
-        runTracker: { listActiveRuns: (owner?: "foreground" | "autonomous") => unknown[] };
-      }
-    ).runTracker.listActiveRuns();
-
-    expect(activeRuns).toHaveLength(0);
-
-    keepQueryAlive.resolve(undefined);
-    await session.close();
-  });
-
-  test("stops retrying live query pump when resumed Claude session no longer exists", async () => {
-    const logger = createTestLogger();
-    let queryCreateCount = 0;
-
-    sdkMocks.query.mockImplementation(() => {
-      queryCreateCount += 1;
-      let step = 0;
-      return {
-        next: vi.fn(async () => {
-          if (step === 0) {
-            step += 1;
-            return {
-              done: false,
-              value: {
-                type: "result",
-                subtype: "error_during_execution",
-                session_id: "new-session-after-missing-conversation",
-                errors: [
-                  "No conversation found with session ID: persisted-stale-session",
-                ],
-                num_turns: 0,
-                duration_ms: 0,
-                duration_api_ms: 0,
-                is_error: true,
-                stop_reason: null,
-                total_cost_usd: 0,
-                usage: buildUsage(),
-              },
-            };
-          }
-          return { done: true, value: undefined };
-        }),
-        interrupt: vi.fn(async () => undefined),
-        return: vi.fn(async () => undefined),
-        setPermissionMode: vi.fn(async () => undefined),
-        setModel: vi.fn(async () => undefined),
-        supportedModels: vi.fn(async () => [{ value: "opus", displayName: "Opus" }]),
-        supportedCommands: vi.fn(async () => []),
-        rewindFiles: vi.fn(async () => ({ canRewind: true })),
-      } satisfies QueryMock;
-    });
-
-    const client = new ClaudeAgentClient({ logger });
-    const handle: AgentPersistenceHandle = {
-      provider: "claude",
-      sessionId: "persisted-stale-session",
-      nativeHandle: "persisted-stale-session",
-      metadata: {
-        provider: "claude",
-        cwd: process.cwd(),
-      },
-    };
-
-    const session = await client.resumeSession(handle, { cwd: process.cwd() });
-    const liveIterator = (
-      session as unknown as {
-        streamLiveEvents: () => AsyncGenerator<AgentStreamEvent>;
-      }
-    ).streamLiveEvents();
-    const liveNext = liveIterator.next();
-
-    await new Promise((resolve) => setTimeout(resolve, 25));
-
-    await new Promise((resolve) => setTimeout(resolve, 650));
-
-    expect(queryCreateCount).toBe(1);
-    expect(session.describePersistence()).toBeNull();
-
-    await session.close();
-    await liveNext;
-  });
-
-  test("does not emit live autonomous turn events for local_agent task_started during a foreground run", async () => {
-    const logger = createTestLogger();
-    const keepQueryAlive = deferred<void>();
-
-    sdkMocks.query.mockImplementation(({ prompt }: { prompt: AsyncIterable<unknown> }) => {
-      const readPromptUuid = createPromptUuidReader(prompt);
-      let step = 0;
-      return {
-        next: vi.fn(async () => {
-          if (step === 0) {
-            step += 1;
-            return {
-              done: false,
-              value: {
-                type: "system",
-                subtype: "init",
-                session_id: "task-started-live-session",
-                permissionMode: "default",
-                model: "opus",
-              },
-            };
-          }
-          if (step === 1) {
-            step += 1;
-            return {
-              done: false,
-              value: {
-                type: "assistant",
-                message: {
-                  id: "tool-call-msg",
-                  content: [
-                    {
-                      type: "tool_use",
-                      id: "toolu_live_1",
-                      name: "Agent",
-                      input: { description: "verify", prompt: "sub-task" },
-                    },
-                  ],
-                },
-              },
-            };
-          }
-          if (step === 2) {
-            step += 1;
-            return {
-              done: false,
-              value: {
-                type: "system",
-                subtype: "task_started",
-                task_id: "task-live-1",
-                tool_use_id: "toolu_live_1",
-                description: "verify",
-                task_type: "local_agent",
-                session_id: "task-started-live-session",
-                uuid: "task-started-live-1",
-              },
-            };
-          }
-          if (step === 3) {
-            step += 1;
-            return {
-              done: false,
-              value: {
-                type: "stream_event",
-                event: {
-                  type: "content_block_start",
-                  index: 2,
-                  content_block: {
-                    type: "tool_use",
-                    id: "toolu_live_2",
-                    name: "Agent",
-                    input: {},
-                    caller: { type: "direct" },
-                  },
-                },
-                session_id: "task-started-live-session",
-                parent_tool_use_id: null,
-                uuid: "content-block-start-live-tool-use",
-              },
-            };
-          }
-          if (step === 4) {
-            step += 1;
-            const promptUuid = (await readPromptUuid()) ?? "missing-prompt-uuid";
-            return {
-              done: false,
-              value: {
-                type: "user",
-                message: { role: "user", content: "current prompt" },
-                parent_tool_use_id: null,
-                uuid: promptUuid,
-                session_id: "task-started-live-session",
-                isReplay: true,
-              },
-            };
-          }
-          if (step === 5) {
-            step += 1;
-            return {
-              done: false,
-              value: {
-                type: "assistant",
-                message: {
-                  content: "FOREGROUND_DONE",
-                },
-              },
-            };
-          }
-          if (step === 6) {
-            step += 1;
-            return {
-              done: false,
-              value: {
-                type: "result",
-                subtype: "success",
-                usage: buildUsage(),
-                total_cost_usd: 0,
-              },
-            };
-          }
-          if (step === 7) {
-            await keepQueryAlive.promise;
-            return { done: true, value: undefined };
-          }
-          return { done: true, value: undefined };
-        }),
-        interrupt: vi.fn(async () => undefined),
-        return: vi.fn(async () => undefined),
-        setPermissionMode: vi.fn(async () => undefined),
-        setModel: vi.fn(async () => undefined),
-        supportedModels: vi.fn(async () => [{ value: "opus", displayName: "Opus" }]),
-        supportedCommands: vi.fn(async () => []),
-        rewindFiles: vi.fn(async () => ({ canRewind: true })),
-      } satisfies QueryMock;
-    });
-
-    const client = new ClaudeAgentClient({ logger });
-    const session = await client.createSession({
-      provider: "claude",
-      cwd: process.cwd(),
-    });
-
-    const foregroundEvents = await collectUntilTerminal(session.stream("current prompt"));
-    const liveIterator = (
-      session as unknown as {
-        streamLiveEvents: () => AsyncGenerator<AgentStreamEvent>;
-      }
-    ).streamLiveEvents();
-    const timedReader = createTimedIteratorReader({ iterator: liveIterator });
-    const liveEvents: AgentStreamEvent[] = [];
-
-    for (let attempt = 0; attempt < 3; attempt += 1) {
-      try {
-        const next = await timedReader.nextWithTimeout(25);
-        if (next.done) {
-          break;
-        }
-        liveEvents.push(next.value);
-      } catch {
-        break;
-      }
-    }
-
-    expect(collectAssistantText(foregroundEvents)).toContain("FOREGROUND_DONE");
-    expect(liveEvents.some((event) => event.type === "turn_started")).toBe(false);
-    expect(liveEvents.some((event) => event.type === "turn_completed")).toBe(false);
-
-    keepQueryAlive.resolve(undefined);
-    await session.close();
-  });
-
-  test("does not let task_notification reservations steal a foreground terminal result", async () => {
-    const logger = createTestLogger();
-    const keepQueryAlive = deferred<void>();
-
-    sdkMocks.query.mockImplementation(({ prompt }: { prompt: AsyncIterable<unknown> }) => {
-      const readPromptUuid = createPromptUuidReader(prompt);
-      let step = 0;
-      return {
-        next: vi.fn(async () => {
-          if (step === 0) {
-            step += 1;
-            return {
-              done: false,
-              value: {
-                type: "system",
-                subtype: "init",
-                session_id: "task-notification-foreground-session",
-                permissionMode: "default",
-                model: "opus",
-              },
-            };
-          }
-          if (step === 1) {
-            step += 1;
-            return {
-              done: false,
-              value: {
-                type: "system",
-                subtype: "task_notification",
-                task_id: "task-foreground-1",
-                tool_use_id: "toolu_foreground_1",
-                status: "completed",
-                output_file: "/tmp/task-foreground-1.txt",
-                summary: "Check Phase 1",
-                session_id: "task-notification-foreground-session",
-                uuid: "task-note-foreground-1",
-              },
-            };
-          }
-          if (step === 2) {
-            step += 1;
-            const promptUuid = (await readPromptUuid()) ?? "missing-prompt-uuid";
-            return {
-              done: false,
-              value: {
-                type: "user",
-                message: { role: "user", content: "verify prompt" },
-                parent_tool_use_id: null,
-                uuid: promptUuid,
-                session_id: "task-notification-foreground-session",
-                isReplay: true,
-              },
-            };
-          }
-          if (step === 3) {
-            step += 1;
-            return {
-              done: false,
-              value: {
-                type: "stream_event",
-                event: {
-                  type: "message_start",
-                  message: {
-                    id: "foreground-tool-msg",
-                    role: "assistant",
-                    model: "opus",
-                    usage: { input_tokens: 1, output_tokens: 0 },
-                  },
-                },
-                session_id: "task-notification-foreground-session",
-                parent_tool_use_id: null,
-                uuid: "foreground-message-start",
-              },
-            };
-          }
-          if (step === 4) {
-            step += 1;
-            return {
-              done: false,
-              value: {
-                type: "stream_event",
-                event: {
-                  type: "content_block_start",
-                  index: 0,
-                  content_block: {
-                    type: "tool_use",
-                    id: "toolu_foreground_2",
-                    name: "Agent",
-                    input: {},
-                    caller: { type: "direct" },
-                  },
-                },
-                session_id: "task-notification-foreground-session",
-                parent_tool_use_id: null,
-                uuid: "foreground-tool-use-start",
-              },
-            };
-          }
-          if (step === 5) {
-            step += 1;
-            return {
-              done: false,
-              value: {
-                type: "assistant",
-                message: {
-                  id: "foreground-final-msg",
-                  content: "FOREGROUND_RESULT_STAYS_ATTACHED",
-                },
-                session_id: "task-notification-foreground-session",
-              },
-            };
-          }
-          if (step === 6) {
-            step += 1;
-            return {
-              done: false,
-              value: {
-                type: "stream_event",
-                event: {
-                  type: "message_delta",
-                  delta: { stop_reason: "end_turn", stop_sequence: null },
-                  usage: { input_tokens: 1, output_tokens: 1 },
-                },
-                session_id: "task-notification-foreground-session",
-                parent_tool_use_id: null,
-                uuid: "foreground-message-delta",
-              },
-            };
-          }
-          if (step === 7) {
-            step += 1;
-            return {
-              done: false,
-              value: {
-                type: "stream_event",
-                event: { type: "message_stop" },
-                session_id: "task-notification-foreground-session",
-                parent_tool_use_id: null,
-                uuid: "foreground-message-stop",
-              },
-            };
-          }
-          if (step === 8) {
-            step += 1;
-            return {
-              done: false,
-              value: {
-                type: "result",
-                subtype: "success",
-                usage: buildUsage(),
-                total_cost_usd: 0,
-                stop_reason: "end_turn",
-                session_id: "task-notification-foreground-session",
-              },
-            };
-          }
-          if (step === 9) {
-            await keepQueryAlive.promise;
-            return { done: true, value: undefined };
-          }
-          return { done: true, value: undefined };
-        }),
-        interrupt: vi.fn(async () => undefined),
-        return: vi.fn(async () => undefined),
-        setPermissionMode: vi.fn(async () => undefined),
-        setModel: vi.fn(async () => undefined),
-        supportedModels: vi.fn(async () => [{ value: "opus", displayName: "Opus" }]),
-        supportedCommands: vi.fn(async () => []),
-        rewindFiles: vi.fn(async () => ({ canRewind: true })),
-      } satisfies QueryMock;
-    });
-
-    const client = new ClaudeAgentClient({ logger });
-    const session = await client.createSession({
-      provider: "claude",
-      cwd: process.cwd(),
-    });
-
-    const foregroundEvents = await collectUntilTerminal(session.stream("verify prompt"));
-    const liveIterator = (
-      session as unknown as {
-        streamLiveEvents: () => AsyncGenerator<AgentStreamEvent>;
-      }
-    ).streamLiveEvents();
-    const timedReader = createTimedIteratorReader({ iterator: liveIterator });
-    const liveEvents: AgentStreamEvent[] = [];
-
-    for (let attempt = 0; attempt < 3; attempt += 1) {
-      try {
-        const next = await timedReader.nextWithTimeout(25);
-        if (next.done) {
-          break;
-        }
-        liveEvents.push(next.value);
-      } catch {
-        break;
-      }
-    }
-
-    expect(collectAssistantText(foregroundEvents)).toContain(
-      "FOREGROUND_RESULT_STAYS_ATTACHED"
-    );
-    expect(foregroundEvents.some((event) => event.type === "turn_completed")).toBe(true);
-    expect(liveEvents.some((event) => event.type === "turn_started")).toBe(false);
-    expect(liveEvents.some((event) => event.type === "turn_completed")).toBe(false);
-
-    keepQueryAlive.resolve(undefined);
-    await session.close();
-  });
-
-  test("emits autonomous live events from SDK stream when Claude wakes itself", async () => {
-    const logger = createTestLogger();
-    let queryCreateCount = 0;
-    let localPromptUuid: string | null = null;
-
-    sdkMocks.query.mockImplementation(
-      ({ prompt }: { prompt: AsyncIterable<unknown> }) => {
-        queryCreateCount += 1;
-        if (queryCreateCount === 1) {
-          const readPromptUuid = createPromptUuidReader(prompt);
-          let step = 0;
-          return {
-            next: vi.fn(async () => {
-              if (step === 0) {
-                step += 1;
-                return {
-                  done: false,
-                  value: {
-                    type: "system",
-                    subtype: "init",
-                    session_id: "live-autonomous-session",
-                    permissionMode: "default",
-                    model: "opus",
-                  },
-                };
-              }
-              if (step === 1) {
-                step += 1;
-                localPromptUuid = (await readPromptUuid()) ?? "missing-prompt-uuid";
-                return {
-                  done: false,
-                  value: {
-                    type: "user",
-                    message: { role: "user", content: "seed prompt" },
-                    parent_tool_use_id: null,
-                    uuid: localPromptUuid,
-                    session_id: "live-autonomous-session",
-                    isReplay: true,
-                  },
-                };
-              }
-              if (step === 2) {
-                step += 1;
-                return {
-                  done: false,
-                  value: {
-                    type: "assistant",
-                    message: { content: "SEED_DONE" },
-                  },
-                };
-              }
-              if (step === 3) {
-                step += 1;
-                return {
-                  done: false,
-                  value: {
-                    type: "result",
-                    subtype: "success",
-                    usage: buildUsage(),
-                    total_cost_usd: 0,
-                  },
-                };
-              }
-              return { done: true, value: undefined };
-            }),
-            interrupt: vi.fn(async () => undefined),
-            return: vi.fn(async () => undefined),
-            setPermissionMode: vi.fn(async () => undefined),
-            setModel: vi.fn(async () => undefined),
-            supportedModels: vi.fn(async () => [{ value: "opus", displayName: "Opus" }]),
-            supportedCommands: vi.fn(async () => []),
-            rewindFiles: vi.fn(async () => ({ canRewind: true })),
-          } satisfies QueryMock;
-        }
-
-        let step = 0;
-        return {
-          next: vi.fn(async () => {
-            if (step === 0) {
-              step += 1;
-              return {
-                done: false,
-                value: {
-                  type: "user",
-                  message: {
-                    role: "user",
-                    content:
-                      "<task-notification>\n<task-id>bg-1</task-id>\n<status>completed</status>\n</task-notification>",
-                  },
-                  parent_tool_use_id: null,
-                  uuid: "task-note-user-1",
-                  session_id: "live-autonomous-session",
-                },
-              };
-            }
-            if (step === 1) {
-              step += 1;
-              return {
-                done: false,
-                value: {
-                  type: "assistant",
-                  message: { content: "AUTONOMOUS_WAKE_RESPONSE" },
-                },
-              };
-            }
-            if (step === 2) {
-              step += 1;
-              return {
-                done: false,
-                value: {
-                  type: "result",
-                  subtype: "success",
-                  usage: buildUsage(),
-                  total_cost_usd: 0,
-                },
-              };
-            }
-            return { done: true, value: undefined };
-          }),
-          interrupt: vi.fn(async () => undefined),
-          return: vi.fn(async () => undefined),
-          setPermissionMode: vi.fn(async () => undefined),
-          setModel: vi.fn(async () => undefined),
-          supportedModels: vi.fn(async () => [{ value: "opus", displayName: "Opus" }]),
-          supportedCommands: vi.fn(async () => []),
-          rewindFiles: vi.fn(async () => ({ canRewind: true })),
-        } satisfies QueryMock;
-      }
-    );
 
     const client = new ClaudeAgentClient({ logger });
     const session = await client.createSession({
@@ -1912,209 +443,68 @@ describe("ClaudeAgentSession interrupt restart regression", () => {
     });
 
     await collectUntilTerminal(session.stream("seed prompt"));
-    expect(localPromptUuid).toBeTruthy();
-    expect(session.describePersistence()?.sessionId).toBe("live-autonomous-session");
-    for (let attempt = 0; attempt < 80; attempt += 1) {
-      const activeTurnPromise = (
-        session as unknown as { activeTurnPromise?: Promise<void> | null }
-      ).activeTurnPromise;
-      if (!activeTurnPromise) {
-        break;
-      }
-      await new Promise((resolve) => setTimeout(resolve, 25));
-    }
-    expect(
-      (session as unknown as { activeTurnPromise?: Promise<void> | null })
-        .activeTurnPromise ?? null
-    ).toBeNull();
 
-    const liveIterator = (
-      session as unknown as {
-        streamLiveEvents: () => AsyncGenerator<AgentStreamEvent>;
-      }
-    ).streamLiveEvents();
-    const timedReader = createTimedIteratorReader({ iterator: liveIterator });
-    const liveEvents: AgentStreamEvent[] = [];
+    const liveIterator = session.streamLiveEvents();
+    queryRef?.emit({
+      type: "assistant",
+      message: { content: "AUTONOMOUS_WAKE_RESPONSE" },
+      session_id: "autonomous-live-session",
+    });
+    queryRef?.emit(buildSuccessResult("autonomous-live-session"));
 
-    for (let attempt = 0; attempt < 8; attempt += 1) {
-      const next = await timedReader.nextWithTimeout(5_000);
-      if (next.done) {
-        break;
-      }
-      liveEvents.push(next.value);
-      if (next.value.type === "turn_completed") {
-        break;
-      }
-    }
+    const started = await liveIterator.next();
+    const timeline = await liveIterator.next();
+    const completed = await liveIterator.next();
 
-    expect(liveEvents.some((event) => event.type === "turn_started")).toBe(true);
-    expect(
-      liveEvents.some(
-        (event) =>
-          event.type === "timeline" &&
-          event.item.type === "assistant_message" &&
-          event.item.text.includes("AUTONOMOUS_WAKE_RESPONSE")
-      )
-    ).toBe(true);
-    expect(liveEvents.some((event) => event.type === "turn_completed")).toBe(true);
+    expect(started.value).toMatchObject({ type: "turn_started", provider: "claude" });
+    expect(timeline.value).toMatchObject({
+      type: "timeline",
+      provider: "claude",
+      item: {
+        type: "assistant_message",
+        text: "AUTONOMOUS_WAKE_RESPONSE",
+      },
+    });
+    expect(completed.value).toMatchObject({
+      type: "turn_completed",
+      provider: "claude",
+    });
 
     await liveIterator.return?.();
     await session.close();
   });
 
-  test("releases local-turn suppression when task notifications arrive as user payloads", async () => {
+  test("auto-completes an open autonomous turn when a foreground prompt starts", async () => {
     const logger = createTestLogger();
-    let queryCreateCount = 0;
-    let localPromptUuid: string | null = null;
+    let queryRef: ScriptedQuery | null = null;
 
-    sdkMocks.query.mockImplementation(
-      ({ prompt }: { prompt: AsyncIterable<unknown> }) => {
-        queryCreateCount += 1;
-        if (queryCreateCount === 1) {
-          const readPromptUuid = createPromptUuidReader(prompt);
-          let step = 0;
-          return {
-            next: vi.fn(async () => {
-              if (step === 0) {
-                step += 1;
-                return {
-                  done: false,
-                  value: {
-                    type: "system",
-                    subtype: "init",
-                    session_id: "live-task-user-session",
-                    permissionMode: "default",
-                    model: "opus",
-                  },
-                };
-              }
-              if (step === 1) {
-                step += 1;
-                localPromptUuid = (await readPromptUuid()) ?? "missing-prompt-uuid";
-                return {
-                  done: false,
-                  value: {
-                    type: "user",
-                    message: { role: "user", content: "seed prompt" },
-                    parent_tool_use_id: null,
-                    uuid: localPromptUuid,
-                    session_id: "live-task-user-session",
-                    isReplay: true,
-                  },
-                };
-              }
-              if (step === 2) {
-                step += 1;
-                return {
-                  done: false,
-                  value: {
-                    type: "assistant",
-                    message: { content: "SEED_DONE" },
-                  },
-                };
-              }
-              if (step === 3) {
-                step += 1;
-                return {
-                  done: false,
-                  value: {
-                    type: "result",
-                    subtype: "success",
-                    usage: buildUsage(),
-                    total_cost_usd: 0,
-                  },
-                };
-              }
-              return { done: true, value: undefined };
-            }),
-            interrupt: vi.fn(async () => undefined),
-            return: vi.fn(async () => undefined),
-            setPermissionMode: vi.fn(async () => undefined),
-            setModel: vi.fn(async () => undefined),
-            supportedModels: vi.fn(async () => [{ value: "opus", displayName: "Opus" }]),
-            supportedCommands: vi.fn(async () => []),
-            rewindFiles: vi.fn(async () => ({ canRewind: true })),
-          } satisfies QueryMock;
-        }
+    sdkMocks.query.mockImplementation(({ prompt }: { prompt: AsyncIterable<unknown> }) => {
+      queryRef = createScriptedQuery({
+        prompt,
+        sessionId: "autonomous-handoff-session",
+        async handlePrompt({ promptRecord, query }) {
+          if (promptRecord.text === "seed prompt") {
+            query.emit({
+              type: "assistant",
+              message: { content: "SEED_RESPONSE" },
+              session_id: "autonomous-handoff-session",
+            });
+            query.emit(buildSuccessResult("autonomous-handoff-session"));
+            return;
+          }
 
-        let step = 0;
-        return {
-          next: vi.fn(async () => {
-            if (step === 0) {
-              step += 1;
-              return {
-                done: false,
-                value: {
-                  type: "user",
-                  message: { role: "user", content: "seed prompt" },
-                  parent_tool_use_id: null,
-                  uuid: localPromptUuid ?? "missing-prompt-uuid",
-                  session_id: "live-task-user-session",
-                  isReplay: true,
-                },
-              };
-            }
-            if (step === 1) {
-              step += 1;
-              return {
-                done: false,
-                value: {
-                  type: "assistant",
-                  message: { content: "SHOULD_STAY_SUPPRESSED" },
-                },
-              };
-            }
-            if (step === 2) {
-              step += 1;
-              return {
-                done: false,
-                value: {
-                  type: "user",
-                  message: {
-                    role: "user",
-                    content:
-                      "<task-notification>\n<task-id>bg-1</task-id>\n<status>completed</status>\n</task-notification>",
-                  },
-                  parent_tool_use_id: null,
-                  uuid: "task-note-user-1",
-                  session_id: "live-task-user-session",
-                },
-              };
-            }
-            if (step === 3) {
-              step += 1;
-              return {
-                done: false,
-                value: {
-                  type: "assistant",
-                  message: { content: "AUTONOMOUS_AFTER_TASK_NOTIFICATION" },
-                },
-              };
-            }
-            if (step === 4) {
-              step += 1;
-              return {
-                done: false,
-                value: {
-                  type: "result",
-                  subtype: "success",
-                  usage: buildUsage(),
-                  total_cost_usd: 0,
-                },
-              };
-            }
-            return { done: true, value: undefined };
-          }),
-          interrupt: vi.fn(async () => undefined),
-          return: vi.fn(async () => undefined),
-          setPermissionMode: vi.fn(async () => undefined),
-          setModel: vi.fn(async () => undefined),
-          supportedModels: vi.fn(async () => [{ value: "opus", displayName: "Opus" }]),
-          supportedCommands: vi.fn(async () => []),
-          rewindFiles: vi.fn(async () => ({ canRewind: true })),
-        } satisfies QueryMock;
-      }
-    );
+          if (promptRecord.text === "foreground prompt") {
+            query.emit({
+              type: "assistant",
+              message: { content: "FOREGROUND_RESPONSE" },
+              session_id: "autonomous-handoff-session",
+            });
+            query.emit(buildSuccessResult("autonomous-handoff-session"));
+          }
+        },
+      });
+      return queryRef;
+    });
 
     const client = new ClaudeAgentClient({ logger });
     const session = await client.createSession({
@@ -2123,75 +513,47 @@ describe("ClaudeAgentSession interrupt restart regression", () => {
     });
 
     await collectUntilTerminal(session.stream("seed prompt"));
-    expect(localPromptUuid).toBeTruthy();
-    expect(session.describePersistence()?.sessionId).toBe("live-task-user-session");
-    for (let attempt = 0; attempt < 80; attempt += 1) {
-      const activeTurnPromise = (
-        session as unknown as { activeTurnPromise?: Promise<void> | null }
-      ).activeTurnPromise;
-      if (!activeTurnPromise) {
-        break;
-      }
-      await new Promise((resolve) => setTimeout(resolve, 25));
-    }
+
+    const liveIterator = session.streamLiveEvents();
+    queryRef?.emit({
+      type: "assistant",
+      message: { content: "BACKGROUND_ONLY_RESPONSE" },
+      session_id: "autonomous-handoff-session",
+    });
+
+    const autonomousStart = await liveIterator.next();
+    const autonomousTimeline = await liveIterator.next();
+    const foregroundEvents = await collectUntilTerminal(session.stream("foreground prompt"));
+    const autonomousComplete = await liveIterator.next();
+
+    expect(autonomousStart.value).toMatchObject({
+      type: "turn_started",
+      provider: "claude",
+    });
+    expect(autonomousTimeline.value).toMatchObject({
+      type: "timeline",
+      provider: "claude",
+      item: {
+        type: "assistant_message",
+        text: "BACKGROUND_ONLY_RESPONSE",
+      },
+    });
+    expect(autonomousComplete.value).toMatchObject({
+      type: "turn_completed",
+      provider: "claude",
+    });
+    expect(foregroundEvents.some((event) => event.type === "turn_completed")).toBe(true);
+    expect(collectAssistantText(foregroundEvents)).toContain("FOREGROUND_RESPONSE");
     expect(
-      (session as unknown as { activeTurnPromise?: Promise<void> | null })
-        .activeTurnPromise ?? null
-    ).toBeNull();
-
-    const liveIterator = (
-      session as unknown as {
-        streamLiveEvents: () => AsyncGenerator<AgentStreamEvent>;
-      }
-    ).streamLiveEvents();
-    const timedReader = createTimedIteratorReader({ iterator: liveIterator });
-    const liveEvents: AgentStreamEvent[] = [];
-
-    for (let attempt = 0; attempt < 12; attempt += 1) {
-      const next = await timedReader.nextWithTimeout(5_000);
-      if (next.done) {
-        break;
-      }
-      liveEvents.push(next.value);
-      if (next.value.type === "turn_completed") {
-        break;
-      }
-    }
-
-    expect(
-      liveEvents.some(
-        (event) =>
-          event.type === "timeline" &&
-          event.item.type === "user_message" &&
-          event.item.text.includes("<task-notification>")
+      [autonomousStart.value, autonomousTimeline.value, autonomousComplete.value].some(
+        (event) => event?.type === "turn_canceled"
       )
     ).toBe(false);
-    expect(
-      liveEvents.some(
-        (event) =>
-          event.type === "timeline" &&
-          event.item.type === "tool_call" &&
-          event.item.name === "task_notification" &&
-          event.item.status === "completed"
-      )
-    ).toBe(true);
-    expect(liveEvents.some((event) => event.type === "turn_started")).toBe(true);
-    expect(
-      liveEvents.some(
-        (event) =>
-          event.type === "timeline" &&
-          event.item.type === "assistant_message" &&
-          event.item.text.includes("SHOULD_STAY_SUPPRESSED")
-      )
-    ).toBe(false);
-    expect(
-      liveEvents.some(
-        (event) =>
-          event.type === "timeline" &&
-          event.item.type === "assistant_message" &&
-          event.item.text.includes("AUTONOMOUS_AFTER_TASK_NOTIFICATION")
-      )
-    ).toBe(true);
+    expect(sdkMocks.query).toHaveBeenCalledTimes(1);
+    expect(queryRef?.prompts.map((prompt) => prompt.text)).toEqual([
+      "seed prompt",
+      "foreground prompt",
+    ]);
 
     await liveIterator.return?.();
     await session.close();
