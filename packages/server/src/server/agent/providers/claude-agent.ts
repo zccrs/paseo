@@ -225,10 +225,6 @@ function applyRuntimeSettingsToClaudeOptions(
   };
 }
 
-function createEmptyClaudePrompt(): AsyncGenerator<SDKUserMessage, void, undefined> {
-  return (async function* empty() {})();
-}
-
 function isClaudeThinkingEffort(value: string | null | undefined): value is ClaudeThinkingEffort {
   return value === "low" || value === "medium" || value === "high" || value === "max";
 }
@@ -1032,8 +1028,9 @@ export class ClaudeAgentClient implements AgentClient {
   }
 
   async listModels(options?: ListModelsOptions): Promise<AgentModelDefinition[]> {
+    const input = createAsyncMessageInput<SDKUserMessage>();
     const claudeQuery = this.queryFactory({
-      prompt: createEmptyClaudePrompt(),
+      prompt: input.iterable,
       options: applyRuntimeSettingsToClaudeOptions(
         {
           cwd: options?.cwd ?? process.cwd(),
@@ -1052,13 +1049,13 @@ export class ClaudeAgentClient implements AgentClient {
       this.logger.warn({ err: error }, "Failed to query Claude supportedModels()");
       throw error;
     } finally {
+      input.end();
       try {
         await claudeQuery.return?.();
       } catch {
         // ignore control-plane shutdown errors
       }
     }
-
   }
 
   async listPersistedAgents(
