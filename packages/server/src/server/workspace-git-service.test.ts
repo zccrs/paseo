@@ -592,6 +592,13 @@ describe("WorkspaceGitServiceImpl", () => {
   });
 
   test("sets a 5-second fallback polling interval when recursive watch is unavailable", async () => {
+    if (process.platform === "linux") {
+      // On Linux, recursive watch is never attempted — the service uses per-directory
+      // watchers from the start. This scenario only applies to macOS/Windows where
+      // recursive watch is tried first and may fail.
+      return;
+    }
+
     const recursiveUnsupported = new Error("recursive unsupported");
     const watch = vi
       .fn()
@@ -629,7 +636,12 @@ describe("WorkspaceGitServiceImpl", () => {
     const target = (service as any).workingTreeWatchTargets.get("/tmp/plain");
 
     expect(subscription.repoRoot).toBeNull();
-    expect(watch).toHaveBeenCalledWith("/tmp/plain", { recursive: true }, expect.any(Function));
+    const expectedRecursive = process.platform !== "linux";
+    expect(watch).toHaveBeenCalledWith(
+      "/tmp/plain",
+      { recursive: expectedRecursive },
+      expect.any(Function),
+    );
     expect(target?.repoWatchPath).toBe("/tmp/plain");
     expect(target?.fallbackRefreshInterval).not.toBeNull();
 
